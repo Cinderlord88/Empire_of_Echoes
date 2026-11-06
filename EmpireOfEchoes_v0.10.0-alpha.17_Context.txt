@@ -1,0 +1,530 @@
+/**
+ * EMPIRE OF ECHOES — CONTEXT
+ * Version: 0.10.0-alpha.17
+ * Script: Context
+ * Release: CBT-01D6 — Intent Detection & Species Registry
+ * Save Schema: 1
+ * Health Schema: 1
+ */
+/**
+ * EMPIRE OF ECHOES — CONTEXT MODIFIER
+ *
+ * Purpose: Inject authoritative game-state instructions into the AI prompt.
+ * Reads state.travel and a small window into the Site's fixed room graph.
+ *
+ * Privacy: Full details of CURRENT room only, except during a pending
+ * AI-assisted transition when directly adjacent rooms are temporarily
+ * supplied as conditional destination data. Never inject the full Site.
+ *
+ * Event-driven travel: AI narrates the JS-controlled checkpoints, but
+ *   cannot advance days, invent new events, or decide mechanical outcomes.
+ * This modifier does not mutate game state; INPUT and OUTPUT do that.
+ */
+const modifier = (text) => {
+  // HP-01B2: Continue can bypass Input entirely. A terminal death must
+  // also be enforced here, without relying on action-count flags.
+  const eoePlayerHealth=eoeHealthCanAct("pc");
+  if (eoePlayerHealth.reason === "dead" ||
+      (eoePlayerHealth.ok===false && eoePlayerHealth.reason==="invalid health record")) {
+    log(`CTX GAME OVER | reason=${eoePlayerHealth.reason}`);
+    return {text:String(text || "") +
+      "\n[HIDDEN: TERMINAL PLAYER DEATH / GAME OVER]\n" +
+      "The player's health is terminal under authoritative JavaScript state. " +
+      "No rescue, resurrection, movement, skill check, continued expedition, or new player decision may occur. " +
+      "The Output Modifier displays GAME OVER; do not generate a new scene.\n"};
+  }
+  // HP-01B3: Narrate fresh authoritative Wounds, and keep any enduring
+  // wound/death facts in scene context. No re-emitting old event outcomes.
+  const healthAction=typeof info!=="undefined" &&
+    Number.isSafeInteger(info.actionCount) ? info.actionCount : null;
+  const healthChange=eoeHealthNarrativeForAction(healthAction);
+  if (healthChange) {
+    text+=healthChange;
+    log(`CTX HEALTH EVENT | action=${healthAction} count=${eoeHealthChangesForAction(healthAction).length}`);
+  }
+  text+=eoeHealthPartyContext();
+  /**
+   * First-discovery encounter cue only. A generated Encounter represents an
+   * actual creature in the room, not merely evidence that one was here.
+   * This is advisory to the storyteller; we do not create an extra JS
+   * encounter status, enforce combat, or try to infer narrative outcomes.
+   */
+  const encounterPresenceCue = (creature) =>
+    `\n[HIDDEN: ENCOUNTER PRESENCE]\n` +
+    `The generated creature ${creature.creatureName} is physically present in this room, ` +
+    `or is entering it at this moment. Make its presence perceptible during this initial scene; ` +
+    `a brief moment of suspense or concealment is fine, but do not substitute only tracks, ` +
+    `remains, rumors, past activity, or speculation for an encounter with the creature itself. ` +
+    `The creature may hide, observe, threaten, communicate, retreat, or attack as its behavior warrants. ` +
+    `Combat is not automatic. Do not dictate the player's actions, reactions, decisions, or feelings.\n`;
+  // Keep the AI at the authoritative location even if a blocked command
+  // appears in the story-history text seen by the model.
+  if (String(state.atdwCommandNotice || "").startsWith("DEPART BLOCKED")) {
+    text += `\n[HIDDEN: BLOCKED DEPARTURE]\nThe latest #DEPART did NOT execute. ` +
+      `The player remains in the present room. Do NOT narrate boarding, liftoff, or leaving the Site. ` +
+      `The crew must navigate back through Area 1 to Eirseid Ship Node 0 before using #DEPART.\n`;
+  }
+  if (String(state.atdwCommandNotice || "").startsWith("Multiple commands found")) {
+    text += `\n[HIDDEN: MULTIPLE COMMANDS REJECTED]\nThe latest player input contained conflicting #commands. ` +
+      `JavaScript executed NONE of them; do not narrate any requested departure, travel checkpoint or room transition. ` +
+      `Keep the story at its current state and allow the player's surrounding dialogue to stand.\n`;
+  }
+  // While script-controlled character setup is active, never improvise a
+  // skill selection or narrate an ignored action. OUTPUT supplies the menu.
+  if (state.eoeSkillSetup && state.eoeSkillSetup.phase !== "complete") {
+    text += `\n[HIDDEN: CHARACTER SETUP]\n` +
+      `A numbered player specialty selection is underway. JavaScript alone ` +
+      `accepts choices. Do not assign skills, roll checks, start travel, ` +
+      `or narrate any mechanical results until setup is complete. ` +
+      `OUTPUT will show the authoritative menu.\n`;
+  }
+  if (state.eoeCrewArchetypeSetup && state.eoeCrewArchetypeSetup.phase !== "complete") {
+    text += `\n[HIDDEN: CREW ARCHETYPE SETUP]\n` +
+      `The player is selecting two NPC expedition archetypes by numbered command. ` +
+      `JavaScript validates both picks and determines their six attributes. ` +
+      `Do not invent selections, silently advance travel, alter crew identities, ` +
+      `or narrate an attempted game action. OUTPUT displays the authoritative menu.\n`;
+  }
+
+  // HP-01C3: Treatment is resolved entirely in JavaScript; no implied
+  // inventory refills, surprise healing, resurrection, or extra player moves.
+  const treatment=state.eoeTreatmentTurn;
+  if (treatment && typeof info!=="undefined" &&
+      Number.isSafeInteger(info.actionCount) && treatment.actionId===info.actionCount) {
+    text+="\n[HIDDEN: AUTHORITATIVE MEDICAL TREATMENT]\n"+
+      (treatment.ok ?
+        `Medical Aid ${treatment.check.success?"succeeded":"failed"}; `+
+        `${treatment.healed} Wound restored to ${treatment.patientName}; `+
+        `${treatment.chargesLeft} field dressings remain. ` :
+        `No treatment occurred: ${treatment.error}. `)+
+      "Do not invent other healing, supplies, NPC consent, patient actions, or player actions. "+
+      "The Output Modifier will REPLACE any generated text with the exact result.\n";
+  }
+
+  const stationTurn=state.eoeStationTurn;
+  if (stationTurn && typeof info!=="undefined" &&
+      Number.isSafeInteger(info.actionCount) && stationTurn.actionId===info.actionCount)
+    text+="\n[HIDDEN: STATION MEDICAL SERVICE]\n"+stationTurn.message+"\n"+
+      "JavaScript controls all Wounds and field dressings. Output replaces narration.\n";
+  const debugTurn=state.eoeDebugTurn;
+  if (debugTurn && typeof info!=="undefined" && Number.isSafeInteger(info.actionCount) &&
+      debugTurn.actionId===info.actionCount) {
+    text+="\n[HIDDEN: DEBUG COMMAND]\n"+
+      "JavaScript already handled #DEBUG. No health or navigation effects may be invented. " +
+      "Output will replace any narration with the exact command result.\n";
+  }
+  const debugTrap=eoeDebugTrapAtLocation();
+  if (debugTrap && debugTrap.trap.status==="pending") {
+    text+="\n[HIDDEN: LOCATION-SCOPED DEBUG TRAP]\n"+
+      `A developer-invoked test mechanical trap is PENDING at ${debugTrap.location.label}. `+
+      "Do not spring or resolve it merely by describing the location, moving, or roleplaying. " +
+      "Only #TRAP EVADE (DEX) or #TRAP DISARM (Technology) may roll and potentially cause 1 Wound. " +
+      "The player may #DEBUG TRAP CLEAR without danger. No freeform narration may award damage.\n";
+  }
+  // HP-01C7: expose just the creature at the CURRENT physical location.
+  // No Story Card triggers, leaked future room records, combat rolls, or Wounds.
+  const debugCreature=eoeDebugCreatureAtLocation();
+  if (debugCreature) {
+    const c=debugCreature.creature;
+    const h=eoeHealthRecord(debugCreature.entry.healthId);
+    text+="\n[HIDDEN: DEBUG CREATURE — CURRENT LOCATION ONLY]\n"+
+      `The player deliberately spawned a real procedural test creature at ${debugCreature.location.label}. `+
+      `Its SPECIES or type is ${c.creatureName}, not a personal name; call it a/the ${String(c.creatureName).toLowerCase()} in prose. Class ${c.creatureClass}; `+
+      `class behavior: ${c.creatureClassBehavior}; `+
+      `trait: ${c.creatureTrait}; ability: ${c.creatureAbility}; `+
+      `drive: ${c.creatureDrive}; engagement: ${eoeCreatureEngagement(debugCreature.entry)}; `+
+      `description: ${c.creaturePhysicalDescription}. `+
+      (h && eoeHealthValidWoundRecord(h)?
+        `Scripted creature health: ${h.woundsRemaining}/${h.maxWounds} Wounds, status ${h.status}. `:"Health currently unverified. ")+
+      (debugCreature.entry.eoeEvasion && debugCreature.entry.eoeEvasion.phase==='ESCAPED'?
+        "Immediate encounter ESCAPED: no pursuit or automatic attack. ":
+        debugCreature.entry.eoeEvasion && debugCreature.entry.eoeEvasion.phase==='HIDDEN'?
+        "Player HIDDEN: creature must search before it can attack. ":"")+
+      (h && h.status==="dead"?
+        "It is DEAD; its body may remain here but it must not move, attack, threaten or return to life. ":
+        (debugCreature.entry.director && debugCreature.entry.director.enabled)?
+        "Autonomous TEST behavior is ON. Only this action's JS Director decision can inflict damage or change range. ":
+        "It is physically present; autonomous behavior is OFF until #DEBUG CREATURE AUTO ON. ")+
+      "Never dictate player actions or invent extra attacks, Wounds or health changes. " +
+      "Scripted weapon+verb input resolves player attacks; creature actions require a recorded Director decision or #DEBUG CREATURE ATTACK. " +
+      "Do not invent other mechanical engagement changes.\n";
+  }
+  const equippedTurn=state.eoeGearTurn;
+  if (equippedTurn && equippedTurn.source==='NATURAL' &&
+      typeof info!=='undefined' && equippedTurn.actionId===info.actionCount) {
+    text+='\n[HIDDEN: AUTHORITATIVE EQUIPMENT SELECTION]\n'+
+      (equippedTurn.ok?`The player explicitly drew/readied ${EOE_WEAPONS[equippedTurn.weaponId].name}; `+
+       'this does NOT include attacking, moving or speaking. Narrate only that declared preparation.':
+       `Equipment action rejected: ${equippedTurn.error}. Do not narrate successful equipping.`)+'\n';
+  }
+  // CBT-01D1: the game engine resolved one actual player attack in Input.
+  // Pass authoritative outcome to storyteller, not a roll request.
+  const combatTurn=state.eoeCombatTurn;
+  if (combatTurn && typeof info!=='undefined' &&
+      Number.isSafeInteger(info.actionCount) && combatTurn.actionId===info.actionCount) {
+    text+='\n[HIDDEN: CBT-01D2 AUTHORITATIVE PLAYER ATTACK]\n'+
+      eoeCombatAttemptContext(combatTurn)+'\n';
+  }
+  const evasionTurn=state.eoeEvasionTurn;
+  if(evasionTurn && typeof info!=="undefined" && evasionTurn.actionId===info.actionCount)
+    text+='\n[HIDDEN: AUTHORITATIVE EVASION]\n'+eoeEvasionContext(evasionTurn)+'\n';
+  const directorTurn=state.eoeCreatureDirectorTurn;
+  if (directorTurn && typeof info!=="undefined" &&
+      directorTurn.actionId===info.actionCount) {
+    text+='\n[HIDDEN: AUTHORITATIVE CREATURE DIRECTOR]\n'+
+      eoeCreatureDirectorContext(directorTurn)+'\n';
+  }
+  const trapTurn=state.eoeTrapTurn;
+  if (trapTurn && typeof info!=="undefined" && Number.isSafeInteger(info.actionCount) &&
+      trapTurn.actionId===info.actionCount) {
+    text+="\n[HIDDEN: SCRIPTED SITE TRAP RESULT]\n"+
+      "The requested #TRAP action has ALREADY been handled by JavaScript. " +
+      "Do not invent extra damage, additional rolls, or player follow-up actions. " +
+      "Output displays the exact scripted response and replaces AI prose.\n";
+  }
+
+  // SKL-01B3: Short-lived check context. Only INPUT performs the roll;
+  // this seed owns success/failure, while the AI supplies atmosphere and
+  // believable consequences without inventing additional game mechanics.
+  const checkTurn=state.eoeCheckTurn;
+  const checkAction=typeof info!=="undefined" && Number.isFinite(info.actionCount)
+    ? info.actionCount : null;
+  if (checkTurn && (checkAction===null || checkTurn.actionId===checkAction)) {
+    if (checkTurn.ok) {
+      const r=checkTurn.result;
+      // Rebuild for older saves in which eoeCheckTurn has no narrativePlan.
+      const plan=checkTurn.narrativePlan ||
+        eoeBuildSkillNarrativePlan(r,checkTurn.attempt,r.actorKind);
+      text+=`\n[HIDDEN: AUTHORITATIVE SKILL CHECK]\n`+
+        `JavaScript already rolled this ATDW d20 check. Actor: ${checkTurn.actorName}; `+
+        `check: ${r.check}; score: ${r.score}; natural die: ${r.die}; total: ${r.total}; `+
+        (r.woundPenalty < 0 ? `wound penalty: ${r.woundPenalty} (already included ONCE in total); ` : "")+
+        `target: ${r.target}; success: ${r.success}; critical: ${r.critical||"none"}. `+
+        `Player-authored attempted action (if any): ${JSON.stringify(checkTurn.attempt)}.\n`+
+        `PROCEDURAL NARRATIVE PLAN — outcome: ${plan.outcome} `+
+        `Immediate consequences: ${plan.immediate} `+
+        `Critical limit: ${plan.critical}\n`+
+        `ACTION RESOLUTION BOUNDARY: ${plan.boundary} `+
+        `You may narrate the necessary physical steps implied by an explicitly attempted action, `+
+        `but do not invent player speech, thoughts, voluntary reactions, new decisions, `+
+        `or follow-up actions. Resolve only this attempted action; then leave the next decision to the player. `+
+        `Do not infer that the player quits, moves on, celebrates, speaks, or changes plans because of the roll. `+
+        `If the action is unspecified, describe only the test result and immediate impressions, `+
+        `not an invented repair, attack, theft or movement. `+
+        `NPCs retain their own autonomy; their actions do not imply the player's agreement. `+
+        `DO NOT change the numerical result, re-roll it, or narrate a failure as success. `+
+        `No health, inventory, salvage, or combat changes are authorized by this skill check alone. `+
+        `The visible roll report comes from Output, not from you.\n`;
+      log(`CTX SKL | actor=${checkTurn.actorName} check=${r.check} success=${r.success}`);
+    } else {
+      text+=`\n[HIDDEN: INVALID SKILL COMMAND]\nNo skill check was rolled. `+
+        `Do not narrate the requested skill action as completed or alter game state. `+
+        `JavaScript Output displays the validation reason.\n`;
+    }
+  }
+
+  const travel = state.travel;
+
+  // ========================================================================
+  /** TRAVEL NARRATION — THREE CHECKPOINTS
+   * (1) liftoff/free roleplay, (2) one event, (3) NPC conclusion/arrival.
+   * Hide future event details until its day. An AI response is not a clock.
+   */
+  // ========================================================================
+  if (travel) {
+    const day = travel.currentDay;
+    const length = travel.tripLength;
+    if (travel.phase === "idle") {
+      text += `\n[HIDDEN: DEPARTURE]\nThe crew has not launched. Allow normal boarding and roleplay. When ready, the player may enter #LIFTOFF. Do not start the journey yourself.\n`;
+    } else if (travel.phase === "traveling") {
+      text += `\n[HIDDEN: EVENT-DRIVEN JOURNEY]\n` +
+        `The Eirseid ship is already launched, ${travel.direction === "return" ? "has departed the Site and is returning to Azaheim" : "has departed Azaheim and is heading toward an unknown Site"}, and is in transit. ` +
+        `Current travel day: ${day}. Estimated journey duration: several days. ` +
+        `${travel.dayNeedsNarration ? "This is the departure response: narrate liftoff clearly and briefly." : "Continue ordinary shipboard roleplay without restarting departure."}\n` +
+        `The player may roleplay freely with the crew or type #CONTINUE to jump to the next SIGNIFICANT EVENT. ` +
+        `Do not advance days because of dialogue, story continuation, or elapsed narrative time. ` +
+        `Do not invent, hint at, or narrate the hidden scheduled event before JavaScript enters the event phase. ` +
+        `Do not decide player actions. Avoid repeated out-of-story prompts: JavaScript displays travel choices.\n`;
+      log(`CTX TRAVEL | ${day}/${length} new=${!!travel.dayNeedsNarration} mode=EVENT_DRIVEN`);
+    } else if (travel.phase === "event") {
+      text += `\n[HIDDEN: FIXED TRAVEL EVENT]\n` +
+        `The voyage has reached the scheduled event on Day ${day} of ${length}.\n` +
+        `FIXED EVENT: ${travel.event}\n` +
+        `${travel.dayNeedsNarration ? "Introduce this event NOW; it is new." : "Continue this SAME event, preserving developments already narrated."}\n` +
+        `Briefly summarize the quiet days between departure and this event if needed, without adding other major incidents. ` +
+        `The ongoing event has not been fully resolved; the player may investigate and roleplay without being forced into a response. ` +
+        (travel.event===EOE_TOOL_FALL_EVENT
+          ? (travel.eoeToolFallResolution?.ok
+              ? `The falling-tool strike ALREADY occurred: ${travel.eoeToolFallResolution.characterName} received exactly one real Wound. This injury was registered by JavaScript. Do not undo it, invent an additional hit, change the injured character, or apply the injury again. The aftermath remains open to player choice. `
+              : `The injury could not be registered safely. Narrate unsecured equipment and the immediate danger, but NO confirmed damage, specific victim, or numeric Wound until JavaScript validates it. `)
+          : "") +
+        `The player can type #CONTINUE at any time to have NPC crewmates deal with the event and advance to arrival. ` +
+        `Do not make up a second event or advance the clock on your own. ` +
+        `The ship is still traveling and no destination can be seen or docked with yet. ` +
+        `Do NOT narrate landing, docking, arrival, departing the ship, or exploring a Site until JavaScript advances the voyage using #CONTINUE.\n`;
+      log(`CTX EVENT | ${day}/${length} new=${!!travel.dayNeedsNarration}`);
+    } else if (travel.phase === "arrived") {
+      text += `\n[HIDDEN: ARRIVAL]\nThe voyage ended on Day ${day} of ${length}. ` +
+        `The generated Site's authoritative arrival scene is below. Describe it NOW, not continued shipboard travel. ` +
+        `The crew is still aboard the ship; do NOT make the player enter the Site. ` +
+        `Do not create another event, destination, or Site. No more #CONTINUE.\n`;
+      log(`CTX ARRIVAL | ${day}/${length}`);
+    } else if (travel.phase === "home") {
+      text += `\n[HIDDEN: AUTHORITATIVE AZAHEIM RETURN SCENE]\n` +
+        `The return voyage is over on Day ${day} of ${length}. The Eirseid ship emerges near Azaheim, the hollow asteroid station with bustling docking machinery and human habitation. ` +
+        `Its familiar docking clamps secure the ship; the airlock leads back into Azaheim. ` +
+        `Sam and Bianca are aboard; describe their reactions and consequences of the voyage without controlling the player's actions. ` +
+        `This is Azaheim, NOT another procedurally generated Site. No site exploration has begun. ` +
+        `The next outbound expedition requires #LIFTOFF or #LAUNCH.\n`;
+      log(`CTX HOME | ${day}/${length}`);
+    } else if (travel.phase === "fatal" || travel.phase === "no_site") {
+      text += `\n[HIDDEN: JOURNEY END]\nArrival result: ${state.lastArrivalResult || "Unknown"}. ` +
+        `No Site can be generated here. Narrate this outcome faithfully.\n`;
+    }
+    // INPUT sets this only for the ONE response where the player skips or
+    // ends the event. Keep fixed event facts and d10 ratings authoritative.
+    if (travel.autoResolutionPendingNarration && travel.eventResolution) {
+      const res = travel.eventResolution;
+      text += `\n[HIDDEN: EVENT AUTO-RESOLUTION — NARRATE BEFORE ARRIVAL]\n` +
+        `Fixed original event (do not erase mandatory consequences): ${res.event}.\n` +
+        `NPC responders chosen by JavaScript: ${res.responders.length ? res.responders.join(", ") : "no NPC names available; describe crew members generically without inventing identities"}. ` +
+        `Only these NPCs take the automatically generated actions. NEVER invent actions, decisions, or dialogue for the player.\n` +
+        `NPC handling quality: ${res.quality}/10 (1 very poor, 10 exceptionally clever). ` +
+        `Additional cost severity: ${res.costSeverity}/10 (1 negligible, 10 very severe). ` +
+        `${res.roleplayActions ? `The player participated in ${res.roleplayActions} previous event turns: incorporate what they actually did without replacing their actions.` : "The player skipped roleplay; narrate a plausible concise NPC solution."}\n` +
+        `Preserve ALL unavoidable injuries, losses, delays and consequences explicitly stated by the fixed event. ` +
+        `Do not pretend that unimplemented JS resources, credits or wound counters have been updated. ` +
+        `Narrate the NPC handling and its plausible cost BRIEFLY, then the exact arrival outcome in this same response.\n`;
+      log(`CTX EVENT AUTO | responders=${res.responders.length} quality=${res.quality} cost=${res.costSeverity}`);
+    }
+  }
+
+  // ========================================================================
+  /** CURRENT EXPEDITION VESSEL — compact authoritative bridge.
+   * The Story Card stores full specifications. Keep the ship identity in
+   * Context even when the Story Card's name is not mentioned by the player.
+   * Never roll a ship on a return leg or on ordinary Continue generations.
+   */
+  if (state.eoeCurrentShip) {
+    const ship = state.eoeCurrentShip;
+    const relevant = travel && (["traveling", "event", "arrived", "exploring", "home", "no_site"].includes(travel.phase)
+      || (travel.phase === "idle" && state.eoeShipAwaitingLaunch === true));
+    if (relevant && (!travel.shipId || travel.shipId === ship.id)) {
+      text += `\n[HIDDEN: AUTHORITATIVE EIRSEID EXPEDITION VESSEL]\n` +
+        `The crew's only assigned ship for this expedition is ${ship.name} (${ship.designation}), ` +
+        `a three-person triangular Eirseid vessel. Its Story Card contains the full physical description. ` +
+        `This SAME ship handles outbound passage, Site docking at Node 0, and the return voyage. ` +
+        `Do not rename it, replace it, or fabricate alternate ship specifications.\n`;
+    }
+  }
+
+  // ========================================================================
+  /** SITE MODE AND IDENTITY
+   * Supply the established Site's metadata, while withholding all room
+   * contents until the crew actually enters an area.
+   */
+  // ========================================================================
+  const site = state.currentSiteId && state.sites
+    ? state.sites[state.currentSiteId] : null;
+  if (!site || !site.nodes) return { text };
+
+  text += `\n[HIDDEN: FIXED SITE]\n` +
+    `The established destination is ${site.name}, a ${String(site.size).toLowerCase()} Site ` +
+    `originally used for ${String(site.purpose).toLowerCase()}. ` +
+    `Expedition records describe its history as “${site.background}” and its environment as “${site.description}”. ` +
+    `The defining Site-wide threat is “${site.hazard}”.\n` +
+    `This Site's entire map and contents were generated once by JavaScript. ` +
+    `No extra rooms, exits, obstacles, encounters or artifacts may be procedurally invented. ` +
+    `Atmosphere, minor texture, conversations and sensory details may be improvised ` +
+    `when consistent with fixed facts. Do not decide for the player's character.\n`;
+
+  if (site.mode === "AT_SHIP") {
+    const entry = getSiteNode(site, site.entryAreaId);
+    const returned = site.lastMove && site.lastMove.to === 0;
+    if (site.arrivalScene) {
+      const firstArrival = travel.phase === "arrived";
+      text += `\n[HIDDEN: AUTHORITATIVE PROCEDURAL ARRIVAL SCENE]\n${site.arrivalScene}\n` +
+        `${firstArrival ? "Introduce the established arrival in this response." : "This is the same established docking location; do not repeat the arrival event."} ` +
+        `Use this composed scene as the fixed physical foundation. Elaborate with atmosphere and NPC reactions, ` +
+        `but do not change the type of destination or invent a different exterior.\n`;
+      log(`CTX ARRIVAL SEED | site=${site.siteId} new=${firstArrival} chars=${site.arrivalScene.length}`);
+    }
+    if (returned) {
+      text += `\n[HIDDEN: RETURNED TO THE EIRSEID SHIP]\nThe player has boarded their OWN ship via its actual docking hatch. ` +
+        `The site remains accessible through that same passage, but the player and crew are now aboard Node 0. ` +
+        `Do not narrate another Site room. #DEPART can initiate the return journey; #ENTER returns to Area 1.\n`;
+    }
+    text += `\n[HIDDEN: ENTRY GATE]\nThe crew is at its ship, OUTSIDE the Site. ` +
+      `Entry has not occurred. ONLY #ENTER may authorize crossing into Area 1. ` +
+      `Do not narrate entering the Site, its first room, exploring its interior, or crossing the docking hatch on ordinary roleplay or Continue turns. ` +
+      `The docking hatch stays closed until the player's explicit #ENTER command.\n`;
+    // ENT-01: no natural-language or AI-authored entry markers are permitted.
+    // The explicit #ENTER is committed by INPUT before Context runs.
+    log(`CTX SITE | ${site.siteId} mode=AT_SHIP pending=${!!site.entryPending}`);
+    return { text };
+  }
+
+  if (site.mode !== "EXPLORING_ACTIVE") return { text };
+  const room = getSiteNode(site, site.currentAreaId);
+  if (!room) {
+    log(`CTX GRAPH ERROR | missing current room=${site.currentAreaId}`);
+    return { text };
+  }
+
+  // ========================================================================
+  /** CURRENT ROOM AND VISIBLE EXITS
+   * Describe ONLY the current graph node and its actual outgoing edges.
+   * Each numbered exit gets approximately one sentence in the story upon
+   * entry or when the player asks to look around. Do not spoil neighbors.
+   */
+  // ========================================================================
+  const last = site.lastMove;
+  // "fresh" means a transition awaiting narration, NOT first discovery.
+  // An already visited destination needs a stronger continuity cue than its
+  // generic procedural result can provide by itself.
+  const fresh = !!(last && last.to === room.areaId && last.needsNarration);
+  const returning = !!(fresh && last.firstVisit === false);
+  const creature = room.encounterCreature;
+  const artifact = room.xenoanthropologicalArtifact;
+  const encounterIntroduced = !!(creature && room.encounterTriggered);
+  const exits = generateGraphNavContext(site);
+  const ambush = fresh && last.ambushNow;
+  // INPUT marks explicit #EXITS requests. This lasts for the current
+  // storyteller response only and is cleared in OUTPUT, including on Retry.
+  const exitsLookOnly = site.exitsLookOnly === true;
+  const sceneNarrative = composeGraphSceneNarrative(site, room, last, !!(fresh && last.firstVisit));
+  // Exit visibility is part of the physical scene, not merely a menu. Give
+  // this task priority on a new-room narration; never spoil where unknown
+  // passages lead or copy JavaScript's numbered user interface.
+  if (fresh) {
+    text += `\n[HIDDEN: ROOM ARRIVAL — DESCRIBE VISIBLE PASSAGES]\n` +
+      `This response must establish the visible approaches and ways out of Area ${room.areaId} in natural prose. ` +
+      `After introducing the current chamber and any urgent discovery, describe EACH of its ${getSiteExits(site).length} actual exits using the physical passage details below. ` +
+      `Do not only name a count of exits; give the player enough observable landmark detail to identify each passage. ` +
+      `These are existing thresholds, not permission for the party to leave, and their undiscovered destinations remain unknown. ` +
+      `Do not reproduce a numbered AREA — EXITS block; JavaScript renders that separately.\n`;
+  }
+  if (fresh && last.from === 0) {
+    text += `\n[HIDDEN: SHIP-TO-SITE TRANSITION]\n#ENTER has JUST authorized crossing the docking hatch. ` +
+      `The player is now PHYSICALLY INSIDE Area ${room.areaId} — ${getGraphRoomTitle(room) || "first chamber"}. ` +
+      `Begin this response in the room itself, using the scene below. Do not spend the response outdoors or at the ship's exterior.\n`;
+  }
+  text += `\n[HIDDEN: EXPLORING ACTIVE]\n` +
+    `The party is currently in Area ${room.areaId}. ${room.visited ? "It has already been discovered." : "It is not yet explored."} ` +
+    `The Site contains ${site.totalAreas} generated areas.\n` +
+    `\n[HIDDEN: AUTHORITATIVE SCENE NARRATIVE]\n` +
+    `${sceneNarrative}\n` +
+    `Treat this as the fixed, prose foundation of the physical scene, not a list of data fields to recite. ` +
+    `Expand it naturally with sensory details and NPC reactions. The room identity, visible contents and crossing passage ` +
+    `are already determined by JavaScript. Do not substitute a new room function or an unrelated discovery. ` +
+    `Do not dictate the player's actions, thoughts or feelings.\n` +
+    (fresh && last.firstVisit && room.result === "Encounter" && creature
+      ? encounterPresenceCue(creature)
+      : ``) +
+    (room.eoeMechanicalTrap && room.hazardManifestation===EOE_MECHANICAL_TRAP_TEXT
+      ? (room.eoeMechanicalTrap.status==="pending"
+        ? `This specific mechanical trap is ARMED but has not injured anyone. JavaScript alone rolls #TRAP EVADE (DEX) or #TRAP DISARM (Technology). The player may move away instead. Do not trigger the trap, claim injury, or force a choice during room discovery, unrelated roleplay, or revisits.\n`
+        : `The mechanical trap is RESOLVED; it cannot attack anyone again or reset on revisit.\n`)
+      : ``) +
+    (room.result === "Hazard Manifestation" && room.hazardManifestation
+      ? (fresh && last.firstVisit
+        ? `For the first visit, introduce this concrete danger without automatically resolving it for the player.\n`
+        : `On revisits and ordinary continuation, do not generate the hazard again; carry forward consequences already established.\n`)
+      : ``) +
+    (creature
+      ? `The known creature's fate (alive, dead, fled, or otherwise) comes from the established narrative. Never resurrect it or spawn a duplicate merely because it has a generated creature record.\n`
+      : ``) +
+    (fresh && last.firstVisit
+      ? `This is the first discovery of this area. Present its existing contents and any immediate complication, but leave choices to the player.\n`
+      : `This is not a new discovery. Continue the same known environment and any unresolved events.\n`) +
+    (ambush ? `The actual traversed passage had an untriggered ambush; narrate it now without introducing a different encounter.\n` : ``) +
+    `\n[HIDDEN: PASSAGES VISIBLE FROM HERE]\n${exits || "No visible passages"}\n` +
+    `Each passage is a threshold visible from this chamber, not permission to reveal unvisited destinations. ` +
+    `JavaScript displays numbered exits to the player. Do not invent extra paths or silently move the party.\n`;
+  log(`CTX SCENE | room=${room.areaId} new=${!!(fresh && last.firstVisit)} revisit=${returning} anchor=${room.roomScene ? "fixed" : "legacy"} chars=${sceneNarrative.length}`);
+
+  // ========================================================================
+  /** RETURN TO A KNOWN ROOM — SAME PHYSICAL LOCATION
+   * The state preserves the deterministic node identity and its contents.
+   * The story is responsible for previously narrated architecture and
+   * consequences. A concise transition-only reminder reduces "new room"
+   * hallucinations without an unreliable AI-to-JS description protocol.
+   */
+  // ========================================================================
+  if (returning) {
+    text += `\n[HIDDEN: RETURN TO PREVIOUSLY VISITED AREA]\n` +
+      `The party just returned to Area ${room.areaId}, the SAME PHYSICAL ROOM previously visited. ` +
+      `This is NOT a new discovery or a different chamber. Follow the existing story history to retain ` +
+      `the established architecture, furnishings, room identity, recognizable landmarks, ` +
+      `visible damage, altered conditions, ongoing hazards, unresolved complications, and NPC positions. ` +
+      `Describe the actual return from Area ${last.from} through the existing ${last.connector} threshold. ` +
+      `Do not replace the known room with a newly invented layout, new room function, or unrelated discovery. ` +
+      `Do not re-trigger previously revealed creatures, hazards, or artifacts; carry forward their established fates. ` +
+      `If the old room details are no longer present in available story context, use its established ` +
+      `current-room facts and exits conservatively rather than inventing a contradictory new location. ` +
+      `Do not choose actions or feelings for the player.\n`;
+    log(`CTX NAV REVISIT | room=${room.areaId} from=${last.from} sameRoom=true`);
+  }
+
+  // ========================================================================
+  /** EXIT INSPECTION — NO MOVEMENT
+   * An explicit #EXITS command is a UI/query request. OUTPUT appends the
+   * stored, numbered exits directly after the normal story response.
+   * CONTEXT keeps the storyteller anchored here without demanding lists.
+   */
+  // ========================================================================
+  if (exitsLookOnly) {
+    text += `\n[HIDDEN: EXIT INSPECTION ONLY]\n` +
+      `The player requested #EXITS to inspect available routes. NO movement has occurred. ` +
+      `The player and crew remain in Area ${room.areaId}. ` +
+      `Do not narrate the player crossing any threshold, choosing a route, entering a corridor, ` +
+      `or discovering the contents of an adjacent area. No new room or encounter is triggered. ` +
+      `After the AI narration, JavaScript will append the authoritative numbered exit list to the story response. ` +
+      `You may briefly describe the visible paths as seen from THIS room, using only the authorized exits above, ` +
+      `but do not number them, invent extra exits, or attempt to reproduce the menu. ` +
+      `Do not treat this query as a choice of route. Leave the decision to the player.\n`;
+    log(`CTX NAV LOOK | room=${room.areaId} noMove=true`);
+  }
+
+  // ========================================================================
+  /** CONDITIONAL AI NAVIGATION ASSESSMENT
+   * If keyword matching was inconclusive, AI may select ONLY an actual exit
+   * on the CURRENT room. Include adjacent hidden contents conditionally so
+   * same-turn movement is narratively faithful; OUTPUT validates the marker.
+   */
+  // ========================================================================
+  const pending = site.navigationPending;
+  if (pending && pending.from === room.areaId) {
+    text += `\n[HIDDEN: MOVEMENT ASSESSMENT]\n` +
+      `The latest player action might traverse an exit, but JavaScript could not choose one confidently. ` +
+      `Determine whether the player ACTUALLY crosses an exit, not merely looks, approaches, discusses, plans, ` +
+      `or orders someone else to go. If uncertain, stay in this room and emit no marker. ` +
+      `If they clearly enter one of the passable authorized exits, narrate ONLY that fixed destination, ` +
+      `then put [SITE_MOVE|${room.areaId}|EXIT_NUMBER] at the very end, replacing EXIT_NUMBER with its numeric exit choice. ` +
+      `This metadata is not in-story text. Do NOT emit multiple markers.\n`;
+    for (const exit of getSiteExits(site)) {
+      if (!pending.allowed.includes(exit.number)) continue;
+      const target = getSiteNode(site, exit.to);
+      text += `If the player actually takes exit ${exit.number}, this is the passage and destination the crew would encounter: ` +
+        `${exit.description} ${target.roomScene || "The destination is a chamber whose established identity must be preserved."} ` +
+        `${describeRoomContents(target, !target.visited)} ` +
+        `${exit.status.ambush && !exit.status.ambushTriggered ? "There may be an ambush on this passage." : ""}\n`;
+    }
+    log(`CTX NAV AI | from=${pending.from} allowed=${pending.allowed.join(",")} candidates=${pending.allowed.length}`);
+  }
+
+  // ========================================================================
+  /** ARTIFACT AND PLAYER AGENCY RULES
+   * Preserve original activation and appraisal limitations. Never let
+   * exploration narration silently collect or activate discovered artifacts.
+   */
+  // ========================================================================
+  text += `\n[HIDDEN: ARTIFACT AND CONTINUITY RULES]\n` +
+    `Artifact function and value are unknown. Do not invent an activation effect, grant a sale value, ` +
+    `or assume collection. Activation needs a successful Technology check and a roll from the ` +
+    `Activating an Artifact table. The player makes their own decisions. ` +
+    `Do not speak, think, decide, or act for the player's character.\n`;
+  log(`CTX GRAPH | site=${site.siteId} room=${room.areaId} exits=${getSiteExits(site).length} transition=${fresh} firstVisit=${last && last.to === room.areaId ? last.firstVisit : "n/a"} pending=${!!pending}`);
+  return { text };
+};
+modifier(text);

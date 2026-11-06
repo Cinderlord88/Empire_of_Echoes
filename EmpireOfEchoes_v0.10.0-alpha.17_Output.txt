@@ -1,0 +1,507 @@
+/**
+ * EMPIRE OF ECHOES — OUTPUT
+ * Version: 0.10.0-alpha.17
+ * Script: Output
+ * Release: CBT-01D6 — Intent Detection & Species Registry
+ * Save Schema: 1
+ * Health Schema: 1
+ */
+/**
+ * EMPIRE OF ECHOES — OUTPUT MODIFIER
+ *
+ * Purpose: Read AI-generated navigation assessment markers, validate every
+ *   transition against the current graph, remove hidden markers from story,
+ *   then show reliable player-facing travel and exit commands.
+ * Event-driven travel: show fixed phase-appropriate commands in state.message.
+ *   Free roleplay never advances time; arrival is chosen by INPUT only.
+ *
+ * Safety: An AI marker is NEVER accepted unless INPUT already recorded a
+ *   genuine movement-intent candidate from the player's latest action.
+ *   A false or stale marker cannot teleport the crew or create a room.
+ *
+ * State: state.sites[siteId].navigationPending, entryPending, lastMove,
+ *   nodes, mode; state.travel; state.message.
+ */
+/**
+ * NAV-07: Observational prose for a standalone #EXITS request.
+ * No AI-generated movement is admitted: descriptions are composed only from
+ * already generated passages and already visited destinations. No new rolls.
+ * This is intentionally separate from the numbered, authoritative exit menu.
+ */
+const eoeDescribeObservedExits = (site, exits) => {
+  if (!exits.length) return "No passage out of this chamber is visible.";
+  const room = getSiteNode(site, site.currentAreaId);
+  const roomTitle = room ? getGraphRoomTitle(room) : "";
+  const place = roomTitle ? `the ${roomTitle.toLowerCase()}` : `Area ${site.currentAreaId}`;
+  const lead = exits.length === 1
+    ? `From ${place}, one route is visible.`
+    : `From ${place}, ${exits.length} distinct routes are visible.`;
+  const openers = ["In one direction, ", "Elsewhere, ", "Another way out is apparent: ", "Finally, "];
+  const prose = exits.map((exit, i) => {
+    const original = String(exit.description || "A passage leads away from the room.").trim();
+    const sentence = original.charAt(0).toLowerCase() + original.slice(1);
+    let description = `${openers[i % openers.length]}${sentence}`;
+    if (!/[.!?]$/.test(description)) description += ".";
+    const dest = getSiteNode(site, exit.to);
+    if (Number(exit.to) === 0) {
+      description += " That hatch leads back aboard the Eirseid ship.";
+    } else if (dest && dest.visited) {
+      const knownTitle = getGraphRoomTitle(dest);
+      description += ` You recognize this route toward Area ${dest.areaId}${knownTitle ? `, the ${knownTitle.toLowerCase()}` : ""}.`;
+    }
+    if (exit.status && (exit.status.locked || exit.status.blocked))
+      description += " The passage is currently obstructed.";
+    return description;
+  });
+  return `${lead}\n\n${prose.join(" ")}`;
+};
+
+const modifier = (text) => {
+  text = String(text || "");
+  // HP-01B3: a wound can be recorded after INPUT (e.g. later hazard engine),
+  // so update existing Story Cards from the final authoritative state too.
+  eoeSyncHealthCards();
+  // HP-01B2: Show terminal death even on a Continue that skipped Input.
+  // Suppress all AI-invented resurrection, movement, or further gameplay.
+  const eoePlayerHealth=eoeHealthCanAct("pc");
+  if (eoePlayerHealth.reason === "dead" ||
+      (eoePlayerHealth.ok===false && eoePlayerHealth.reason==="invalid health record")) {
+    if (state.message !== undefined) state.message="";
+    log(`OUT GAME OVER | reason=${eoePlayerHealth.reason}`);
+    return {text:eoePlayerHealth.reason === "dead"
+      ? eoeHealthGameOverText()
+      : "GAME OVER — HEALTH STATE ERROR\nThe adventure cannot safely continue with an invalid player health record."};
+  }
+  // SKL-01B1: Input owns the choices; Output owns the visible, deterministic
+  // menu. Suppress speculative AI prose for accepted/rejected selections.
+  const setup = state.eoeSkillSetup;
+  const currentAction = typeof info !== "undefined" && Number.isFinite(info.actionCount)
+    ? info.actionCount : null;
+  const setupReplyNow = setup && setup.lastResponse &&
+    (currentAction === null || setup.lastActionId === currentAction);
+  if (setup && (setup.phase !== "complete" ||
+        (setup.phase === "complete" && setupReplyNow && setup.lastResponse.complete &&
+         !(state.eoeCrewArchetypeSetup && state.eoeCrewArchetypeSetup.phase !== "complete")))) {
+    state.message = "";
+    const menu = eoeSkillSetupDisplay(setup, setupReplyNow ? setup.lastResponse : null);
+    log(`OUT SKL SETUP | phase=${setup.phase} picks=${setup.picks.length} chars=${menu.length}`);
+    return {text:menu};
+  }
+  // SKL-01B2a: only the script builds archetype selection menus. Suppress
+  // storyteller output during choices so no AI-invented stats or movement.
+  const crewSetup=state.eoeCrewArchetypeSetup;
+  const crewReplyNow=crewSetup && crewSetup.lastResponse &&
+    (currentAction === null || crewSetup.lastActionId === currentAction);
+  if (crewSetup && (crewSetup.phase !== "complete" ||
+      (crewSetup.phase === "complete" && crewReplyNow && crewSetup.lastResponse.complete))) {
+    state.message="";
+    const menu=eoeCrewArchetypeSetupDisplay(crewSetup,crewReplyNow ? crewSetup.lastResponse : null);
+    log(`OUT CREW SETUP | phase=${crewSetup.phase} picks=${crewSetup.picks.length} chars=${menu.length}`);
+    return {text:menu};
+  }
+  if (state.eoeCrewSetupNotice) {
+    state.message="";
+    const notice=state.eoeCrewSetupNotice;
+    state.eoeCrewSetupNotice="";
+    return {text:notice};
+  }
+
+  if (state.eoeSkillSetupNotice) {
+    state.message = "";
+    const notice = state.eoeSkillSetupNotice;
+    state.eoeSkillSetupNotice = "";
+    return {text:notice};
+  }
+  const gearTurn=state.eoeGearTurn;
+  if (gearTurn && currentAction!==null && gearTurn.actionId===currentAction) {
+    state.message='';
+    if(gearTurn.source==='NATURAL' && gearTurn.ok)
+      return {text:eoeCreatureDirectorOutput(String(text||'').trim() ||
+        `You ready your ${EOE_WEAPONS[gearTurn.weaponId].name.toLowerCase()}.`,
+        state.eoeCreatureDirectorTurn && state.eoeCreatureDirectorTurn.actionId===currentAction ?
+          state.eoeCreatureDirectorTurn:null)};
+    return {text:gearTurn.ok?gearTurn.message:`GEAR — NO ACTION\n${gearTurn.error}`};
+  }
+  const combatTurn=state.eoeCombatTurn;
+  if (combatTurn && currentAction!==null && combatTurn.actionId===currentAction) {
+    state.message='';
+    if(!combatTurn.ok) return {text:`ATTACK — NO ACTION\n${combatTurn.error}`};
+    // Narration is intentionally primary: no debug-style dice readout.
+    // A non-empty AI response may embellish, but Context sets hard bounds.
+    // Fallback handles a blank AI response without inventing an enemy death.
+    const ai=String(text||'').trim();
+    const result=ai || (combatTurn.creatureDead
+      ? `Your ${combatTurn.weaponName.toLowerCase()} strikes ${combatTurn.targetName}. The creature collapses and dies.`
+      : combatTurn.hit
+        ? `Your ${combatTurn.weaponName.toLowerCase()} strikes ${combatTurn.targetName}; the wounded creature remains alive.`
+        : `Your ${combatTurn.weaponName.toLowerCase()} attack fails to connect with ${combatTurn.targetName}. The creature remains a threat.`);
+    // Death is mechanically terminal even if the storyteller omits a death cue.
+    // Add one unobtrusive sentence only when needed; leave successful prose intact.
+    const hasDeathCue=/\b(?:dead|dies|died|lifeless|motionless|falls still|goes limp|last breath|expires|collapsed|collapses|killed)\b/i.test(result);
+    const finalText=combatTurn.creatureDead && !hasDeathCue
+      ? `${result}\n${combatTurn.targetName} collapses and lies motionless.` : result;
+    log(`OUT CBT MODE2 | action=${currentAction} hit=${combatTurn.hit} wound=${combatTurn.creatureWoundApplied} remaining=${combatTurn.creatureWoundsRemaining}/${combatTurn.creatureMaxWounds} dead=${combatTurn.creatureDead}`);
+    const director=state.eoeCreatureDirectorTurn;
+    if (director && director.actionId===currentAction)
+      log(`OUT CBT DIRECTOR | action=${currentAction} kind=${director.kind} hit=${director.hit===undefined?'n/a':director.hit} wound=${director.strike?director.strike.woundApplied:0}`);
+    return {text:eoeCreatureDirectorOutput(finalText,director&&director.actionId===currentAction?director:null)};
+  }
+  const evasion=state.eoeEvasionTurn;
+  if(evasion && currentAction!==null && evasion.actionId===currentAction){
+    const director=state.eoeCreatureDirectorTurn;
+    const ai=String(text||'').trim();
+    const fallback=!evasion.ok?`The attempt cannot be resolved: ${evasion.error}`:
+      evasion.kind==='HIDE'?
+        evasion.success?'You slip into concealment. The creature begins searching.':'You attempt to hide, but the creature keeps you in view.':
+        evasion.phase==='ESCAPED'?'You get clear of immediate pursuit.':
+        evasion.success?'You gain distance from the creature, but have not yet left the area.':
+        'You try to flee, but cannot shake the creature.';
+    const resolvedDirector=director && director.actionId===currentAction?director:null;
+    const reconciled=eoeReconcileEvasionProse(ai,evasion,resolvedDirector);
+    log(`OUT CBT EVASION | action=${currentAction} kind=${evasion.kind} success=${!!evasion.success} phase=${evasion.phase||'NONE'}`);
+    if(reconciled!==ai && ai) log(`OUT CBT EVASION | action=${currentAction} conflicting-narration-replaced=true`);
+    if(resolvedDirector) log(`OUT CBT DIRECTOR | action=${currentAction} kind=${resolvedDirector.kind} hit=${resolvedDirector.hit===undefined?'n/a':resolvedDirector.hit} wound=${resolvedDirector.strike?resolvedDirector.strike.woundApplied:0}`);
+    // Failed evasion can include one separately resolved, actual Director attack.
+    return {text:eoeCreatureDirectorOutput(reconciled||fallback,resolvedDirector)};
+  }
+  const director=state.eoeCreatureDirectorTurn;
+  if (director && currentAction!==null && director.actionId===currentAction &&
+      !(state.eoeGearTurn && state.eoeGearTurn.actionId===currentAction && !state.eoeGearTurn.ok)) {
+    state.message='';
+    log(`OUT CBT DIRECTOR | action=${currentAction} kind=${director.kind} hit=${director.hit===undefined?'n/a':director.hit} wound=${director.strike?director.strike.woundApplied:0}`);
+    return {text:eoeCreatureDirectorOutput(String(text||'').trim(),director)};
+  }
+  const difficultyTurn=state.eoeCombatDifficultyTurn;
+  if (difficultyTurn && currentAction!==null && difficultyTurn.actionId===currentAction) {
+    state.message="";
+    return {text:difficultyTurn.ok ? difficultyTurn.message :
+      `COMBAT DIFFICULTY — NO ACTION\n${difficultyTurn.error}`};
+  }
+  const debugTurn=state.eoeDebugTurn;
+  if (debugTurn && currentAction!==null && debugTurn.actionId===currentAction) {
+    state.message="";
+    return {text:debugTurn.ok ? debugTurn.message : `DEBUG — NO ACTION\n${debugTurn.error}`};
+  }
+  const trapTurn=state.eoeTrapTurn;
+  if (trapTurn && currentAction!==null && trapTurn.actionId===currentAction) {
+    state.message="";
+    return {text:eoeSiteTrapReport(trapTurn)};
+  }
+  const stationTurn=state.eoeStationTurn;
+  if (stationTurn && currentAction!==null && stationTurn.actionId===currentAction) {
+    state.message="";
+    return {text:stationTurn.message};
+  }
+  const medkitTurn=state.eoeMedkitTurn;
+  if (medkitTurn && currentAction!==null && medkitTurn.actionId===currentAction) {
+    state.message="";
+    return {text:medkitTurn.message};
+  }
+  // HP-01C3: controlled healing is a complete scripted action.
+  // Suppress all AI prose (including fictitious recoveries or inventory)
+  // rather than risk contradicting a failed check or blocked treatment.
+  const treatment=state.eoeTreatmentTurn;
+  if (treatment && currentAction!==null && treatment.actionId===currentAction) {
+    state.message="";
+    log(`OUT MEDICAL | action=${currentAction} status=${treatment.ok?"rolled":"rejected"}`);
+    return {text:eoeHealthTreatmentReport(treatment)};
+  }
+
+  // SKL-01B3 — Script-owned result strip. An invalid command must not
+  // accidentally progress the scene. Successful rolls receive a fixed report
+  // before AI prose, so even a missing AI response cannot hide the result.
+  const checkTurn=state.eoeCheckTurn;
+  if (checkTurn && (currentAction===null || checkTurn.actionId===currentAction)) {
+    state.message="";
+    const report=eoeSkillCheckResultText(checkTurn);
+    if (!checkTurn.ok) {
+      log(`OUT SKL REJECT | ${checkTurn.error}`);
+      return {text:report};
+    }
+    // The storyteller may imitate a roll report, occasionally with
+    // invented numbers. Remove only those machine-style imitation lines;
+    // preserve its ordinary prose, then display the real JS report once.
+    const aiProse=String(text||"")
+      .replace(/^[ \t]*SKILL CHECK RESULT[^\r\n]*(?:\r?\n[ \t]*D20[^\r\n]*)?/gmi,"")
+      .trim();
+    text = report + (aiProse?`\n\n${aiProse}`:"");
+    log(`OUT SKL RESULT | actor=${checkTurn.actorName} check=${checkTurn.check} total=${checkTurn.result.total} success=${checkTurn.result.success}`);
+  }
+
+  const site = state.currentSiteId && state.sites
+    ? state.sites[state.currentSiteId] : null;
+  const travel = state.travel;
+  let acceptedMove = false;
+  let acceptedEntry = false;
+
+  // ========================================================================
+  /** AI MARKER VALIDATION
+   * [SITE_MOVE|CURRENT_ROOM|EXIT_NUMBER] and [SITE_ENTER] are metadata,
+   * not prose. Consume every occurrence and commit at most one action.
+   */
+  // ========================================================================
+  text = text.replace(/\[\s*SITE_(?:MOVE|ENTER)\b[^\]\n]*\]/gi, (marker) => {
+    const entryMarker = /^\[\s*SITE_ENTER\s*\]$/i.test(marker);
+    const moveMarker = marker.match(/^\[\s*SITE_MOVE\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\]$/i);
+    if (entryMarker) {
+      // ENT-01: only player-issued #ENTER in INPUT may cause site entry.
+      log(`OUT MARKER REJECT | SITE_ENTER never authorizes movement`);
+    } else if (moveMarker) {
+      const from = Number(moveMarker[1]);
+      const number = Number(moveMarker[2]);
+      const pending = site && site.navigationPending;
+      if (site && site.nodes && site.mode === "EXPLORING_ACTIVE" && !acceptedMove &&
+          pending && pending.from === from && site.currentAreaId === from &&
+          pending.allowed.includes(number)) {
+        acceptedMove = commitGraphMovement(site, number, "AI");
+        log(`OUT SITE MOVE | from=${from} exit=${number} accepted=${acceptedMove}`);
+      } else log(`OUT MARKER REJECT | marker=${marker.slice(0, 70)} current=${site ? site.currentAreaId : "none"}`);
+    } else log(`OUT MARKER REJECT | malformed=${marker.slice(0, 70)}`);
+    return "";
+  });
+  // ========================================================================
+  /** LEGACY ENCOUNTER METADATA CLEANUP
+   * V1 no longer asks the AI to declare combat outcomes mechanically.
+   * Strip obsolete markers if the narrator still emits one, without changing
+   * creature state. Creature fate belongs entirely to the story.
+   */
+  // ========================================================================
+  text = text.replace(/\[\s*SITE_ENCOUNTER\b[^\]\n]*\]/gi, "");
+
+  // Never leave AI engine-only markers on screen. Old prompt wording is
+  // stripped because it incorrectly describes the retired day-by-day model.
+  text = text.replace(/Continue to the next day\?\s*Type #CONTINUE to do so\.?/gi, "");
+  text = text.replace(/Travel may resume\.\s*Type #RESUME to continue\.?/gi, "");
+  text = text.replace(/Ready for departure\?\s*Type #LIFTOFF to launch\.?/gi, "");
+  // The model must NEVER own a numbered exit menu. It occasionally copies
+  // an earlier AREA X — EXITS block but supplies only one or two invented
+  // entries. Strip those lookalikes before the JS-owned menu is rendered.
+  // This does not remove narrative discussion of passages or landmarks.
+  let aiMenusRemoved = 0;
+  text = text.replace(
+    /(?:^|\r?\n)[ \t]*AREA[ \t]+\d+[ \t]*[—–-][ \t]*EXITS[ \t]*(?:\r?\n(?:[ \t]*\d+[.)][^\r\n]*|[ \t]*Type[ \t]+#(?:EXPLORE|EXITS)[^\r\n]*|[ \t]*))*/gi,
+    () => { aiMenusRemoved++; return ""; }
+  );
+  if (aiMenusRemoved) log(`OUT AI EXIT MENU SCRUB | count=${aiMenusRemoved}`);
+  // Only OUTPUT writes the canonical persistent AREA heading. A storyteller
+  // sometimes imitates it, particularly when an automatic menu appears before
+  // the room prose. Strip all standalone AI-authored area titles first.
+  // Keep AREA <n> — EXITS reserved for the authoritative exit-menu scrub above.
+  let aiHeadingsRemoved = 0;
+  text = text.replace(
+    /^[ \t]*AREA[ \t]+\d+[ \t]*[—–-][ \t]*(?!EXITS\b)[^\r\n]*(?:\r?\n)?/gmi,
+    () => { aiHeadingsRemoved++; return ""; }
+  );
+  if (aiHeadingsRemoved) log(`OUT AI AREA HEADING SCRUB | count=${aiHeadingsRemoved}`);
+  // A standalone #EXITS must be observational only, but must not delete the
+  // player's requested *description* of the routes. The AI might invent a
+  // traversal, so replace only this pure-query response with graph-grounded
+  // descriptive prose; the canonical numbered list is appended below.
+  // #AUTOEXITS ON retains the existing immediate-menu-only behavior.
+  if (site && site.exitsLookOnly && site.exitsStandalone) {
+    if (site.nodes && site.mode === "EXPLORING_ACTIVE") {
+      // The toggle's command notice distinguishes it from #EXITS without
+      // requiring any new state fields or changing INPUT.
+      const isToggleOn = /^Automatic inline exits: ON\./.test(String(state.atdwCommandNotice || ""));
+      text = isToggleOn ? "" : eoeDescribeObservedExits(site, getSiteExits(site));
+    } else {
+      text = "";
+    }
+    log(`OUT NAV OBSERVATION | room=${site.currentAreaId} chars=${text.length}`);
+  }
+  text = text.trim();
+
+  // ========================================================================
+  /** ASSESSMENT CLEANUP
+   * An omitted marker changes no map state. If the player attempted a move,
+   * tell them how to select an exit explicitly rather than guessing.
+   */
+  // ========================================================================
+  if (site && site.nodes) {
+    if (site.navigationPending && !acceptedMove) {
+      site.navWarning = "Route unclear. Describe a specific exit or use #EXPLORE<number>.";
+      site.showExits = true;
+      log(`OUT NAV UNRESOLVED | from=${site.navigationPending.from} allowed=${site.navigationPending.allowed.join(",")}`);
+    }
+    if (site.entryPending && !acceptedEntry) {
+      site.navWarning = "To enter the Site, type #ENTER.";
+      log(`OUT ENTRY UNRESOLVED | site=${site.siteId}`);
+    }
+    site.navigationPending = null;
+    site.entryPending = false;
+
+    if (site.lastMove && site.lastMove.needsNarration) {
+      const node = getSiteNode(site, site.lastMove.to);
+      if (node) node.discoveryNarrated = true;
+      site.lastMove.needsNarration = false;
+    }
+    // AI-handled entry/movement is narrated in the same AI response.
+    if (acceptedMove || acceptedEntry) {
+      const node = getSiteNode(site, site.currentAreaId);
+      if (node) node.discoveryNarrated = true;
+    }
+  }
+
+  // ========================================================================
+  /** SCRIPTED PLAYER MESSAGES
+   * Prompts remain separate from story prose on entry and nav warnings.
+   * Explicit #EXITS instead appends JS-owned routes to the ordinary story,
+   * preventing an unnecessary second popup and guaranteeing player access.
+   */
+  // ========================================================================
+  state.message = state.atdwCommandNotice || "";
+  state.atdwCommandNotice = "";
+  // Capture stable per-action information before cleanup. One-shot UI flags
+  // can be consumed by OUTPUT or Retry; movement's actionCount survives.
+  const pureExitQuery = !!(site && site.exitsLookOnly && site.exitsStandalone);
+  const moveInThisAction = !!(site && site.mode === "EXPLORING_ACTIVE" &&
+    site.lastMove && Number(site.lastMove.to) === Number(site.currentAreaId) &&
+    typeof info !== "undefined" && Number.isFinite(info.actionCount) &&
+    Number.isFinite(site.lastMove.actionCount) &&
+    site.lastMove.actionCount === info.actionCount);
+  const reminderDue = travel && (travel.phase === "traveling" || travel.phase === "event")
+    ? atdwTickTurnReminder("travel", ATDW_SETTINGS.TRAVEL_REMINDER_TURNS)
+    : false;
+  if (travel) {
+    if (travel.phase === "idle") {
+      if (!state.message) state.message = "Ready for departure? Type #LIFTOFF or #LAUNCH when aboard the ship.";
+    } else if (travel.phase === "traveling") {
+      if (travel.dayNeedsNarration && travel.direction === "outbound" && state.eoeCurrentShip && travel.currentDay === 1)
+        state.message = `ASSIGNED EIRSEID SHIP: ${state.eoeCurrentShip.name} — see its Story Card.\n`;
+      if (travel.dayNeedsNarration)
+        state.message += `EIRSEID ${travel.direction === "return" ? "RETURN " : ""}JOURNEY — DAY ${travel.currentDay}\n` +
+          "Roleplay aboard the ship or type #CONTINUE for the next event.";
+      else if (reminderDue)
+        state.message = "TRAVEL REMINDER: You may keep roleplaying as long as you like. Type #CONTINUE to advance the voyage.";
+    } else if (travel.phase === "event") {
+      if (travel.dayNeedsNarration)
+        state.message = `TRAVEL EVENT — DAY ${travel.currentDay}\n` +
+          "Roleplay the incident, or type #CONTINUE to let the NPC crew resolve it and finish this voyage.";
+      else if (reminderDue)
+        state.message = "TRAVEL REMINDER: Continue roleplaying the incident, or type #CONTINUE to let the NPC crew resolve it and advance.";
+    } else if (travel.phase === "arrived") {
+      state.message = site
+        ? `ARRIVAL COMPLETE\nSite: ${site.name}\n` +
+          `The crew is aboard Node 0. Type #ENTER to enter the Site.`
+        : "ARRIVAL COMPLETE";
+      // Arrival narration has happened once; normal Site play is now allowed.
+      travel.phase = "exploring";
+    } else if (travel.phase === "home") {
+      state.message = "AZAHEIM ARRIVAL COMPLETE — The crew is home. Prepare another expedition, then type #LIFTOFF or #LAUNCH.";
+      state.travel = { phase: "idle", direction: "outbound", currentDay: 0, tripLength: 0,
+        eventDay: 0, event: null, eventTriggered: false, eventResolved: false,
+        siteGenerated: false, dayNeedsNarration: false, eventRoleplayActions: 0,
+        autoResolutionPendingNarration: false };
+      log(`OUT HOME COMPLETE | from=${state.lastCompletedSiteId || "none"}`);
+    } else if (travel.phase === "fatal") {
+      state.message = "JOURNEY ENDED — fatal arrival.";
+    } else if (travel.phase === "no_site") {
+      state.message = "No Site discovered. Another #LIFTOFF may begin a new trip.";
+    }
+    if (travel.dayNeedsNarration) travel.dayNeedsNarration = false;
+    // One-turn narration instruction; the rolled resolution stays in state.
+    if (travel.autoResolutionPendingNarration) travel.autoResolutionPendingNarration = false;
+    travel.dayPromptDue = false;
+  }
+
+  if (site && site.nodes && site.mode === "AT_SHIP" && travel && travel.phase === "exploring") {
+    state.message = state.message || (site.lastMove && site.lastMove.to === 0
+      ? "ABOARD EIRSEID SHIP — Node 0. Type #ENTER to return to Area 1, or #DEPART to start the return voyage."
+      : "AT SITE — Aboard Eirseid ship, Node 0. Type #ENTER to enter Area 1.");
+    site.navWarning = null;
+  }
+  if (site && site.nodes && site.mode === "EXPLORING_ACTIVE") {
+    const exits = getSiteExits(site);
+    // On any room arrival, guarantee observable passage descriptions even if
+    // the storyteller ignores its explicit CONTEXT instruction. Only add
+    // missing landmarks; avoid re-narrating passages already established by AI.
+    if ((moveInThisAction || (site.exitsLookOnly && !pureExitQuery)) && exits.length) {
+      const sceneLower = text.toLowerCase();
+      const missing = exits.filter(exit =>
+        !exit.landmark || !sceneLower.includes(String(exit.landmark).toLowerCase()));
+      if (missing.length) {
+        const descriptions = missing.map(exit => String(exit.description || "").trim())
+          .filter(Boolean).map(sentence => /[.!?]$/.test(sentence) ? sentence : `${sentence}.`);
+        if (descriptions.length) {
+          text = text ? `${text}\n\nVisible from this chamber: ${descriptions.join(" ")}`
+            : `Visible from this chamber: ${descriptions.join(" ")}`;
+          log(`OUT PASSAGE SCENE FALLBACK | room=${site.currentAreaId} missing=${descriptions.length}/${exits.length}`);
+        }
+      }
+    }
+    // Stable action-backed triggering: do not require site.showExits (which
+    // OUTPUT deliberately consumes), nor a consumed needsNarration flag.
+    // The original one-shot behavior remains as a compatibility fallback
+    // for older saves without actionCount on their lastMove record.
+    const autoExits = !!(state.atdwSettings && state.atdwSettings.autoExits &&
+      (moveInThisAction || (site.showExits && site.lastMove &&
+        Number(site.lastMove.to) === Number(site.currentAreaId))));
+    if (site.showExits || autoExits || site.navWarning) {
+      // One authoritative formatter for both #EXITS and optional popups.
+      // Only visited destinations are named; last traversal identifies
+      // the particular exit by its persisted passage ID.
+      const lines = exits.map(exit => formatGraphExitLine(site, exit));
+      const exitMenu = `AREA ${site.currentAreaId} — EXITS\n${lines.join("\n")}\n` +
+        `Type #EXPLORE<number> to choose a numbered exit, or describe where you go.`;
+      if ((site.exitsLookOnly || autoExits) && !site.navWarning) {
+        // Direct, authoritative UI-to-story bridge: every descriptor comes
+        // from the graph, NEVER from the AI. Put automatic menus BEFORE the
+        // narration so any host trailing-output clipping cannot remove exits.
+        // Manual #EXITS retains the familiar story-then-menu order.
+        if (autoExits && !site.exitsLookOnly)
+          text = text ? `${exitMenu}\n\n${text}` : exitMenu;
+        else
+          text = text ? `${text}\n\n${exitMenu}` : exitMenu;
+        log(`OUT EXITS INLINE | room=${site.currentAreaId} auto=${autoExits} count=${exits.length} options=${exits.map(e => `${e.number}->${e.to}`).join(",")}`);
+      } else if (ATDW_SETTINGS.SHOW_ROOM_EXPLORATION_POPUPS || site.navWarning) {
+        // Automatic room-entry popups are optional; warnings remain visible
+        // even when the setting is off, so invalid commands can be corrected.
+        state.message = `AREA ${site.currentAreaId} — EXITS\n${lines.join("\n")}\n` +
+          `Type #EXPLORE1, #EXPLORE2, etc., or describe where you go.\n` +
+          `Type #EXITS to show exits again.`;
+        if (site.navWarning) state.message = `${site.navWarning}\n\n${state.message}`;
+        log(`OUT EXITS | room=${site.currentAreaId} count=${exits.length} options=${exits.map(e => `${e.number}->${e.to}`).join(",")}`);
+      } else {
+        log(`OUT EXITS POPUP SUPPRESSED | room=${site.currentAreaId} count=${exits.length}`);
+      }
+    }
+    site.showExits = false;
+    site.exitsLookOnly = false; // explicit #EXITS narratorial instruction is one response only
+    site.exitsStandalone = false; // do not leak query-only behavior into later turns
+    site.navWarning = null;
+    log(`OUT GRAPH | mode=${site.mode} room=${site.currentAreaId} ` +
+      `visited=${Object.values(site.nodes).filter(n => n.visited).length}/${site.totalAreas}`);
+  }
+  // Persistent location heading: JS state, not the model's account of
+  // where the party is. Applies to EVERY exploring response, including Say,
+  // Continue, combat, movement and #EXITS. Legacy rooms receive AREA only.
+  if (site && site.nodes && site.mode === "EXPLORING_ACTIVE") {
+    if (ATDW_SETTINGS.SHOW_AREA_HEADINGS && !pureExitQuery) {
+      const currentNode = getSiteNode(site, site.currentAreaId);
+      const title = getGraphRoomTitle(currentNode);
+      const heading = `AREA ${site.currentAreaId}${title ? ` — ${title}` : ""}`;
+      if (!text.startsWith(heading + "\n")) text = `${heading}\n\n${text}`;
+      log(`OUT AREA HEADING | room=${site.currentAreaId} title=${title || "none"}`);
+    } else {
+      log(`OUT AREA HEADING SKIPPED | room=${site.currentAreaId} pureQuery=${pureExitQuery}`);
+    }
+  }
+  // HP-01C5: deterministic invitation on first discovery, not a trap attack.
+  if (site && site.nodes && site.mode==="EXPLORING_ACTIVE" &&
+      site.lastMove && site.lastMove.actionCount===currentAction &&
+      site.lastMove.firstVisit &&
+      getSiteNode(site,site.currentAreaId)?.eoeMechanicalTrap?.status==="pending") {
+    text=`SITE HAZARD — MECHANICAL TRAP\n`+
+      `The mechanism threatens the party but has NOT struck. `+
+      `Choose #TRAP EVADE (DEX), #TRAP DISARM (Technology), or leave by an existing exit.\n\n`+text;
+  }
+  // HP-01B3: Only health changes committed in THIS action get a report.
+  // Keep the AI's scene prose intact; never create wounds from narration.
+  const healthReport=eoeHealthReportForAction(currentAction);
+  if (healthReport) {
+    text=healthReport+(text?`\n\n${text}`:"");
+    log(`OUT HEALTH EVENT | action=${currentAction} count=${eoeHealthChangesForAction(currentAction).length}`);
+  }
+  return { text };
+};
+modifier(text);

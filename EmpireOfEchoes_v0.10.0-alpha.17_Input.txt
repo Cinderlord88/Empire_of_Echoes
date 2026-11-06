@@ -1,0 +1,974 @@
+/**
+ * EMPIRE OF ECHOES — INPUT
+ * Version: 0.10.0-alpha.17
+ * Script: Input
+ * Release: CBT-01D6 — Intent Detection & Species Registry
+ * Save Schema: 1
+ * Health Schema: 1
+ */
+/**
+ * EMPIRE OF ECHOES — INPUT MODIFIER
+ *
+ * Purpose: Authoritative controller for travel, arrival, and navigation.
+ *   INPUT decides game state before the AI narrates anything.
+ *
+ * Commands:
+ *   #LIFTOFF/#LAUNCH, #CONTINUE, #DEPART — outbound and return travel
+ *   #RESUME — compatibility alias during a travel event
+ *   #ENTER — enter the Site from the ship
+ *   #EXITS — redisplay exits in the current room
+ *   #AUTOEXITS [ON|OFF] — player-configurable inline exit listing
+ *   #EXPLORE1 / #EXPLORE 1 / ... — choose a numbered exit
+ *
+ * #Commands: recognized anywhere in player input, even with Say-mode
+ *   dialogue, ignoring case; distinct simultaneous commands are rejected.
+ * Natural language: conservative movement/keyword matching, then an AI
+ *   assessment fallback validated by OUTPUT. Uncertain movement never
+ *   commits here without a clear match.
+ *
+ * Travel pacing: Unhurried roleplay never advances the calendar. The first
+ *   #CONTINUE skips to the scheduled event; the second #CONTINUE resolves
+ *   it through randomly selected NPC crew and finishes the journey.
+ *   No automatic X-turn cutoff in V1. Never treat the AI as a calendar.
+ * State: state.travel, state.sites, state.currentSiteId, state.currentAreaId.
+ * All generation functions are supplied by LIBRARY.
+ */
+const modifier = (text) => {
+  // HP-01B2: check saved terminal state BEFORE crew/site/ship setup. Once the
+  // protagonist dies, even idempotent initialization must not progress game.
+  const savedPcHealth=state.eoeHealth && state.eoeHealth.records &&
+    state.eoeHealth.records.pc;
+  if (savedPcHealth) {
+    const terminal=eoeHealthCanAct("pc");
+    if (terminal.reason === "dead" ||
+        (terminal.ok===false && terminal.reason==="invalid health record")) {
+      log(`HEALTH GAME OVER INPUT | reason=${terminal.reason}`);
+      return {text:"[GAME OVER: no player action is executed]"};
+    }
+  }
+
+  // ========================================================================
+  /** INITIALIZATION
+   * Creates persistent state and original crew/pre-scouted Story Cards once.
+   */
+  // ========================================================================
+  // Capture pre-existing save status BEFORE generating any engine defaults.
+  // Only truly fresh Story-start adventures begin selection automatically.
+  const eoeHadEstablishedSave = !!(state.travel || state.currentSiteId ||
+    state.lastCompletedSiteId || state.preScoutedSitesCreated ||
+    state.crewCardsCreated || state.eoeCurrentShip || state.sites ||
+    state.eoeSkillSetup || state.eoePlayerProfile || state.eoeCrewArchetypes);
+  // VER-01: version metadata must not count as an "established character"
+  // and must never trigger a save reset or forced re-creation.
+  eoeEnsureReleaseMeta();
+  if (!state.sites) state.sites = {};
+  if (!state.nextSiteId) state.nextSiteId = 1;
+  if (state.currentSiteId === undefined) state.currentSiteId = null;
+  if (!state.crewCardsCreated) generateCrewCards();
+  if (!state.preScoutedSitesCreated) generatePreScoutedSites();
+  // Existing adventures remain playable without forced retroactive setup.
+  if (!eoeHadEstablishedSave && !state.eoeSkillSetup && !state.eoePlayerProfile) {
+    state.eoeSkillSetup = eoeNewSkillSetup();
+    log("SKL SETUP | new adventure, primary specialty pending");
+  }
+  // A fresh setup also queues two validated crew choices. Older saves keep
+  // their established NPC numbers unless the player requests #CREWSETUP.
+  if (!eoeHadEstablishedSave && !state.eoeCrewArchetypeSetup && !state.eoeCrewArchetypes) {
+    state.eoeCrewArchetypeSetup=eoeNewCrewArchetypeSetup();
+    log("CREW SETUP | new adventure, crew #2 archetype pending");
+  }
+  eoeEnsureCrewNpcProfiles();
+  if (state.eoePlayerProfile) eoeEnsurePlayerProfileCard();
+  // HP-01A: seed persistent health records without changing gameplay.
+  // Safe for established saves; never resets wounded/dead records.
+  eoeEnsureAllHealthRecords();
+  // HP-01C3: seed a finite, one-time field dressing stock for old and new
+  // saves alike, without refreshing it on a new expedition or a Retry.
+  eoeMedicalStore();
+  // HP-01B3: project registered Wound facts onto the existing PC/crew cards.
+  // Does not infer wounds or create a separate medical Story Card.
+  eoeSyncHealthCards();
+  atdwEnsurePlayerSettings();
+  eoeEnsureCombatDifficulty();
+  // CBT-01D1: idempotently provide the 9mm sidearm and combat knife from
+  // the scenario's standard-issue kit. Never reset owned/lost weapons.
+  eoeWeaponInventory();
+  // CBT-01D6: migrate only creatures currently encountered/visible.
+  eoeEnsureVisibleCreatureSpecies();
+  if (state.eoeImplicitSkillsEnabled === undefined)
+    state.eoeImplicitSkillsEnabled = ATDW_SETTINGS.IMPLICIT_SKILL_CHECKS_DEFAULT !== false;
+  atdwEnsureGameCommandsCard();
+  // Restore an existing ship card if a save has state but lost the Card.
+  // No new ship is rolled except at a new outbound launch.
+  if (state.eoeCurrentShip) eoeEnsureShipCard(state.eoeCurrentShip);
+  state.atdwCommandNotice = "";
+
+  const emptyTravel = () => ({
+    phase: "idle", currentDay: 0, tripLength: 0, eventDay: 0,
+    event: null, eventTriggered: false, eventResolved: false,
+    siteGenerated: false, dayNeedsNarration: false,
+    dayActions: 0, dayPromptDue: false,
+    eventRoleplayActions: 0, eventResolution: null,
+    autoResolutionPendingNarration: false, direction: "outbound"
+  });
+  if (!state.travel) state.travel = emptyTravel();
+  let travel = state.travel;
+  // The player's crew may describe, inspect or board its vessel BEFORE
+  // #LIFTOFF. Assign the initial ship at scenario setup, not at departure.
+  // For legacy saves already underway, create a matching current-expedition
+  // card once without resetting the travel clock or regenerating any Site.
+  if (!state.eoeCurrentShip) {
+    const activeTravel = ["traveling", "event", "arrived", "exploring", "home", "no_site"]
+      .includes(travel.phase);
+    const activeSite = state.currentSiteId && state.sites[state.currentSiteId];
+    const freshPreparation = travel.phase === "idle" && !state.lastCompletedSiteId
+      && !activeSite && (state.nextSiteId || 1) === 1;
+    if (activeTravel || activeSite || freshPreparation) {
+      const backfilled = eoeAssignShipToOutboundExpedition();
+      if (backfilled) {
+        state.eoeShipAwaitingLaunch = !!freshPreparation;
+        if (activeTravel && !travel.shipId) travel.shipId = backfilled.id;
+        if (activeSite && !activeSite.shipId) activeSite.shipId = backfilled.id;
+        log(`SHIP ${freshPreparation ? "PREASSIGNED" : "BACKFILLED"} | id=${backfilled.id}`);
+      }
+    }
+  }
+  const raw = String(text || "");
+  const input = raw.trim();
+  const upper = input.toUpperCase();
+  // HP-01B2: A dead PC has reached a terminal game state. Reject all
+  // subsequent commands and natural-language actions before any mutations.
+  // Do not return stop:true: AI Dungeon documents an Input error for it.
+  const eoePlayerHealth=eoeHealthCanAct("pc");
+  if (eoePlayerHealth.reason === "dead" ||
+      (eoePlayerHealth.ok===false && eoePlayerHealth.reason==="invalid health record")) {
+    log(`HEALTH GAME OVER INPUT | reason=${eoePlayerHealth.reason}`);
+    return {text:"[GAME OVER: no player action is executed]"};
+  }
+  // SKL-01B1: Self-contained numbered setup, before the generic #command
+  // parser. Reject incomplete or ambiguous selections rather than guessing.
+  // Other commands, including launch, cannot bypass an incomplete profile.
+  const setupRequest = /^(?:>\s*(?:You\s+)?)?#SKILLSETUP[.!]?$/i.test(input);
+  const actionId = typeof info !== "undefined" && Number.isFinite(info.actionCount)
+    ? info.actionCount : null;
+  if (setupRequest && (!state.eoeSkillSetup || state.eoeSkillSetup.phase === "complete")) {
+    const canSetup = state.travel && state.travel.phase === "idle" && !state.currentSiteId;
+    if (canSetup) {
+      state.eoeSkillSetup = eoeNewSkillSetup();
+      state.eoeSkillSetup.lastResponse = {ok:true, complete:false, reason:"Skill setup started."};
+      state.eoeSkillSetup.lastActionId = actionId;
+      log("SKL SETUP | manually started at Azaheim");
+    } else {
+      state.eoeSkillSetupNotice = "SKILL SETUP UNAVAILABLE — Use #SKILLSETUP while at Azaheim, before launch.";
+      log("SKL SETUP | blocked while voyage or site active");
+    }
+    return { text };
+  }
+  if (state.eoeSkillSetup && state.eoeSkillSetup.phase !== "complete") {
+    if (setupRequest) {
+      // Redisplay menu without consuming a choice.
+      state.eoeSkillSetup.lastResponse = {ok:true, complete:false, reason:"Choose a specialty."};
+      state.eoeSkillSetup.lastActionId = actionId;
+    } else if (state.eoeSkillSetup.picks.length === 0 &&
+        state.eoeSkillSetup.lastResponse == null) {
+      // First turn introduces choices; do not lose a valid numeric selection.
+      if (/^(?:>\s*(?:You\s+)?)?(?:#(?:CHOOSE|SELECT)\s*|(?:OPTION|CHOICE)\s+)?[0-9]+[.!]?$/i.test(input))
+        eoeTakeSkillSetupChoice(raw, actionId);
+      else {
+        state.eoeSkillSetup.lastResponse = {ok:true, complete:false, reason:"Choose your three specialties before play."};
+        state.eoeSkillSetup.lastActionId = actionId;
+      }
+    } else {
+      eoeTakeSkillSetupChoice(raw, actionId);
+    }
+    return { text };
+  }
+
+  // SKL-01B2a: explicit numbered archetype menu. Only #CREWSETUP can
+  // replace a legacy crew's attributes, and only while preparing at Azaheim.
+  const crewSetupRequest=/^(?:>\s*(?:You\s+)?)?#CREWSETUP[.!]?$/i.test(input);
+  if (crewSetupRequest && (!state.eoeCrewArchetypeSetup ||
+      state.eoeCrewArchetypeSetup.phase === "complete")) {
+    const canSetup=state.travel && state.travel.phase === "idle" && !state.currentSiteId;
+    if (canSetup) {
+      state.eoeCrewArchetypeSetup=eoeNewCrewArchetypeSetup();
+      state.eoeCrewArchetypeSetup.lastResponse={ok:true,complete:false,reason:"Crew setup started."};
+      state.eoeCrewArchetypeSetup.lastActionId=actionId;
+      log("CREW SETUP | manually started at Azaheim");
+    } else {
+      state.eoeCrewSetupNotice="CREW SETUP UNAVAILABLE — Use #CREWSETUP while at Azaheim, before launch.";
+      log("CREW SETUP | blocked while voyage or site active");
+    }
+    return {text};
+  }
+  if (state.eoeCrewArchetypeSetup && state.eoeCrewArchetypeSetup.phase !== "complete") {
+    if (crewSetupRequest) {
+      state.eoeCrewArchetypeSetup.lastResponse={ok:true,complete:false,reason:"Choose a crew archetype."};
+      state.eoeCrewArchetypeSetup.lastActionId=actionId;
+    } else {
+      eoeTakeCrewArchetypeChoice(raw,actionId);
+    }
+    return {text};
+  }
+
+  // A read-only stock query, deterministic and safe on Retry.
+  if (/(?:^|[^A-Z0-9_#])#MEDKIT(?![A-Z0-9_])/i.test(raw)) {
+    let status;
+    if ((raw.match(/#[A-Za-z][A-Za-z0-9_]*/g)||[]).length!==1 ||
+        !/^\s*(?:>\s*(?:You\s+)?)?#MEDKIT[.!?]*\s*$/i.test(raw))
+      status="MEDKIT REJECTED — Use #MEDKIT alone, without another command.";
+    else {
+      const stock=eoeMedicalStore();
+      status=stock?`MEDKIT — ${stock.charges} field dressing${stock.charges===1?"":"s"} remaining (one consumed per attempted #TREAT; #RESUPPLY at Azaheim or #DEBUG MEDKIT REFILL).`:
+        "MEDKIT UNAVAILABLE — Medical stock state is invalid or unsupported.";
+    }
+    state.eoeMedkitTurn={actionId,message:status};
+    return {text};
+  }
+  // MED-01B: station services are explicit and never run in combat, Sites,
+  // flight, or through ordinary roleplay. Cached actions are immutable on Retry.
+  if (/(?:^|[^A-Z0-9_#])#(?:RESUPPLY|CLINIC)(?![A-Z0-9_])/i.test(raw)) {
+    if (state.eoeStationTurn && actionId!==null && state.eoeStationTurn.actionId===actionId) return {text};
+    const cache=state.eoeStationActionCache;
+    const key=actionId===null?null:String(actionId);
+    let result;
+    if (cache && (cache.schemaVersion!==1 || !cache.actions || typeof cache.actions!=="object" ||
+        Array.isArray(cache.actions) || !Array.isArray(cache.order)))
+      result={ok:false,message:"AZAHEIM MEDICAL — NO ACTION\nInvalid action cache; no change."};
+    else if (cache && key!==null && Object.prototype.hasOwnProperty.call(cache.actions,key))
+      result={...cache.actions[key]};
+    else {
+      const m=input.match(/^(?:>\s*(?:You\s+)?)?#(RESUPPLY|CLINIC)(?:[ \t]+([^#\r\n]{1,120}?))?[ \t.!?]*$/i);
+      if (key===null || (raw.match(/#[A-Za-z][A-Za-z0-9_]*/g)||[]).length!==1 || !m)
+        result={ok:false,message:"AZAHEIM MEDICAL — NO ACTION\nUse #RESUPPLY or #CLINIC Player alone."};
+      else {
+        const op=m[1].toUpperCase(),target=(m[2]||"PLAYER").trim().toLowerCase();
+        if (op==="RESUPPLY" && m[2])
+          result={ok:false,message:"AZAHEIM MEDICAL — NO ACTION\nUse #RESUPPLY alone."};
+        else {
+          let patientId=["player","me","myself","self","pc"].includes(target)?"pc":
+            target==="crew2"?"crew:2":target==="crew3"?"crew:3":null;
+          if (patientId===null) {
+            const choices=[2,3].filter(slot=>{const p=state.eoeCrewProfiles && state.eoeCrewProfiles[slot];
+              return p && p.kind==="NPC" && String(p.name||"").trim().toLowerCase()===target;});
+            if (choices.length===1) patientId=`crew:${choices[0]}`;
+          }
+          result=op==="RESUPPLY" ? eoeMedicalStationCommand("RESUPPLY",null,`station:${actionId}`) :
+            patientId ? eoeMedicalStationCommand("CLINIC",patientId,`clinic:action:${actionId}`) :
+            {ok:false,message:"AZAHEIM MEDICAL — NO ACTION\nUnknown patient; use Player, CREW2, CREW3, or a current companion name."};
+        }
+      }
+      if (key!==null && !(cache && Object.prototype.hasOwnProperty.call(cache.actions,key))) {
+        const ledger=cache || {schemaVersion:1,actions:{},order:[]};
+        ledger.actions[key]={...result};ledger.order.push(key);
+        while (ledger.order.length>64) delete ledger.actions[ledger.order.shift()];
+        state.eoeStationActionCache=ledger;
+      }
+    }
+    state.eoeStationTurn={...result,actionId};
+    return {text};
+  }
+
+  // HP-01C3: #TREAT is the ONLY Wound-restoring player command.
+  // Requires one specific patient and an action ID for Retry safety.
+  // Do not permit combined hash commands or unparseable target names to
+  // trigger a treatment, roll, travel, or navigation transition.
+  if (/(?:^|[^A-Z0-9_#])#TREAT(?![A-Z0-9_])/i.test(raw)) {
+    if (state.eoeTreatmentTurn && actionId!==null &&
+        state.eoeTreatmentTurn.actionId===actionId) return {text};
+    let t;
+    if (actionId===null) t={ok:false,error:"Treatment requires an action ID."};
+    else if ((raw.match(/#[A-Za-z][A-Za-z0-9_]*/g)||[]).length!==1)
+      t={ok:false,error:"Use one distinct #TREAT command per action; no other #commands."};
+    else {
+      // Normalize only surrounding whitespace: AI Dungeon may append LF/CRLF
+      // or spaces when displaying "You #treat Player.". Leave any internal
+      // line breaks intact so a mixed-command or extra-prose action stays
+      // rejected rather than silently treating someone.
+      const match=input.match(/(?:^|[^A-Z0-9_#])#TREAT(?:[ \t]+([^#\r\n]{1,120}?))?[ \t.!?]*$/i);
+      if (!match) t={ok:false,error:"Usage: #TREAT Player, #TREAT CREW2, or #TREAT <full companion name>."};
+      else {
+        const name=(match[1]||"PLAYER").trim().toLowerCase();
+        let patientId=["player","me","myself","self","pc"].includes(name)?"pc":
+          name==="crew2"?"crew:2":name==="crew3"?"crew:3":null;
+        if (patientId===null) {
+          const profiles=[2,3].map(slot=>state.eoeCrewProfiles && state.eoeCrewProfiles[slot])
+            .filter(p=>p && p.kind==="NPC" && [2,3].includes(p.slot) &&
+              String(p.name||"").trim().toLowerCase()===name);
+          if (profiles.length===1) patientId=`crew:${profiles[0].slot}`;
+        }
+        if (!patientId) t={ok:false,error:"Patient not recognized. Use Player, CREW2, CREW3, or an exact current companion name."};
+        else t=eoeHealthTreat({patientId,eventId:`treat:action:${actionId}`});
+      }
+    }
+    state.eoeTreatmentTurn={...t,actionId};
+    return {text};
+  }
+
+  // CBT-01D1: small, one-command equipment interface; never invent a weapon.
+  if (/(?:^|[^A-Z0-9_#])#(?:GEAR|EQUIP)(?![A-Z0-9_])/i.test(raw)) {
+    if (state.eoeGearTurn && actionId!==null && state.eoeGearTurn.actionId===actionId) return {text};
+    const cache=state.eoeGearActionCache;const key=actionId===null?null:String(actionId);
+    let result;
+    if (cache && (cache.schemaVersion!==1 || !cache.actions || !Array.isArray(cache.order)))
+      result={ok:false,error:'Equipment history invalid; no change made.'};
+    else if (cache && key!==null && Object.prototype.hasOwnProperty.call(cache.actions,key))
+      result=cache.actions[key];
+    else if (actionId===null) result={ok:false,error:'Equipment command requires stable action ID.'};
+    else if ((raw.match(/#[A-Za-z][A-Za-z0-9_]*/g)||[]).length!==1)
+      result={ok:false,error:'Use one equipment command at a time.'};
+    else if (/^(?:>\s*(?:You\s+)?)?#GEAR[.!?]*$/i.test(input))
+      result={ok:true,message:eoeWeaponInventoryDisplay()};
+    else {
+      const m=input.match(/^(?:>\s*(?:You\s+)?)?#EQUIP[ \t]+(.+?)[.!?]*$/i);
+      result=m?eoeWeaponEquip(m[1]):{ok:false,error:'Use #GEAR or #EQUIP PISTOL / #EQUIP KNIFE.'};
+    }
+    if (key!==null && (!cache || !Object.prototype.hasOwnProperty.call(cache.actions,key)) &&
+        !(cache && (cache.schemaVersion!==1 || !Array.isArray(cache.order)))) {
+      const ledger=cache || {schemaVersion:1,actions:{},order:[]};
+      ledger.actions[key]={...result};ledger.order.push(key);
+      while(ledger.order.length>64)delete ledger.actions[ledger.order.shift()];
+      state.eoeGearActionCache=ledger;
+    }
+    state.eoeGearTurn={...result,actionId};return {text};
+  }
+
+  // CBT-01C: one standalone combat difficulty command; plain #COMMANDS
+  // works even when another triggerless Story Card blocks the quick-reference.
+  if (/(?:^|[^A-Z0-9_#])#(?:COMBAT|COMMANDS)(?![A-Z0-9_])/i.test(raw)) {
+    if (state.eoeCombatDifficultyTurn && actionId!==null &&
+        state.eoeCombatDifficultyTurn.actionId===actionId) return {text};
+    const cache=state.eoeCombatDifficultyActionCache;
+    let result;
+    const key=actionId===null?null:String(actionId);
+    if (cache && (cache.schemaVersion!==1 || !cache.actions ||
+        typeof cache.actions!=="object" || Array.isArray(cache.actions) ||
+        !Array.isArray(cache.order))) {
+      result={ok:false,error:"Difficulty action history invalid; no changes made."};
+    } else if (cache && key!==null && Object.prototype.hasOwnProperty.call(cache.actions,key)) {
+      result={...cache.actions[key]};
+    } else if (actionId===null) {
+      result={ok:false,error:"Difficulty command requires a stable action ID."};
+    } else if ((raw.match(/#[A-Za-z][A-Za-z0-9_]*/g)||[]).length!==1) {
+      result={ok:false,error:"Use one standalone #COMBAT DIFFICULTY or #COMMANDS command."};
+    } else if (/^(?:>\s*(?:You\s+)?)?#COMMANDS[.!?]*$/i.test(input)) {
+      result={ok:true,message:atdwCommandCardText()};
+    } else {
+      const match=input.match(/^(?:>\s*(?:You\s+)?)?#COMBAT[ \t]+DIFFICULTY(?:[ \t]+([1-5]))?[.!?]*$/i);
+      result=!match ? {ok:false,error:"Use #COMBAT DIFFICULTY or #COMBAT DIFFICULTY 1 through 5."} :
+        match[1] ? eoeCombatSetDifficulty(Number(match[1])) : eoeCombatDifficultyStatus();
+    }
+    if (key!==null && (!cache || !Object.prototype.hasOwnProperty.call(cache.actions,key)) &&
+        !(cache && (cache.schemaVersion!==1 || !Array.isArray(cache.order)))) {
+      const ledger=cache || {schemaVersion:1,actions:{},order:[]};
+      ledger.actions[key]={...result};ledger.order.push(key);
+      while (ledger.order.length>64) delete ledger.actions[ledger.order.shift()];
+      state.eoeCombatDifficultyActionCache=ledger;
+    }
+    state.eoeCombatDifficultyTurn={...result,actionId};
+    return {text};
+  }
+
+  // HP-01C6: explicit, location-scoped debug fixture. Never edits room rolls.
+  if (/(?:^|[^A-Z0-9_#])#DEBUG(?![A-Z0-9_])/i.test(raw)) {
+    if (state.eoeDebugTurn && actionId!==null &&
+        state.eoeDebugTurn.actionId===actionId) return {text};
+    // Keep a bounded, persisted action ledger. An older Retry must not CLEAR
+    // a newer creature or respawn a past fixture after another debug command.
+    const cache=state.eoeDebugActionCache;
+    if (cache && (cache.schemaVersion!==1 || !cache.actions ||
+        typeof cache.actions!=="object" || Array.isArray(cache.actions) ||
+        !Array.isArray(cache.order))) {
+      state.eoeDebugTurn={ok:false,error:"Debug action cache invalid; no action taken.",actionId};
+      return {text};
+    }
+    const key=actionId===null?null:String(actionId);
+    if (cache && key!==null && Object.prototype.hasOwnProperty.call(cache.actions,key)) {
+      state.eoeDebugTurn={...cache.actions[key],actionId};
+      return {text};
+    }
+    let result;
+    if ((raw.match(/#[A-Za-z][A-Za-z0-9_]*/g)||[]).length!==1)
+      result={ok:false,error:"Use one #DEBUG command per action; do not combine commands."};
+    else {
+      const auto=input.match(/^(?:>\s*(?:You\s+)?)?#DEBUG[ \t]+CREATURE[ \t]+AUTO[ \t]+(ON|OFF|STATUS)[.!?]*$/i);
+      const m=auto?null:input.match(/^(?:>\s*(?:You\s+)?)?#DEBUG(?:[ \t]+(?:(TRAP|CREATURE)[ \t]+(SPAWN|CLEAR|STATUS|ATTACK)(?:[ \t]+(BRUTE|LURKER|RANGED|SWARM|PSYCHIC))?|(MEDKIT)[ \t]+(REFILL)|(TREAT)[ \t]+(SUCCESS)|(RANGE)[ \t]+(STATUS|AT_RANGE|ENGAGED)))?[.!?]*$/i);
+      if (auto) result=eoeCreatureDirectorCommand(auto[1].toUpperCase(),actionId);
+      else if (!m) result={ok:false,error:"Use #DEBUG CREATURE AUTO ON/OFF/STATUS, #DEBUG CREATURE SPAWN/STATUS/CLEAR/ATTACK, #DEBUG RANGE STATUS/AT_RANGE/ENGAGED, #DEBUG TRAP, #DEBUG MEDKIT, or #DEBUG TREAT."};
+      else if (!m[1] && !m[4] && !m[6] && !m[8]) result={ok:true,message:"DEBUG COMMANDS — #DEBUG CREATURE AUTO ON/OFF/STATUS; #DEBUG TRAP SPAWN/CLEAR/STATUS; #DEBUG CREATURE SPAWN [BRUTE|LURKER|RANGED|SWARM|PSYCHIC], CLEAR, STATUS; #DEBUG CREATURE ATTACK; #DEBUG RANGE STATUS/AT_RANGE/ENGAGED; #DEBUG MEDKIT REFILL; #DEBUG TREAT SUCCESS. Range commands change only test fixture engagement, and player rifle attacks are not implemented. Director auto-combat is OFF by default, enables via #DEBUG CREATURE AUTO ON, and uses provisional one-Wound-on-hit rules."};
+      else if (m[8]) result=eoeDebugRangeCommand(String(m[9]).toUpperCase(),actionId);
+      else if (m[4]) result=eoeMedicalDebugRefill();
+      else if (m[6]) {
+        const t=eoeHealthTreat({patientId:"pc",eventId:`debug:treat:action:${actionId}`,
+          debugAuthorized:true,debugRolls:[20]});
+        result=t.ok ? {ok:true,message:"DEBUG TREAT SUCCESS — deterministic natural 20 through the real treatment engine.\n"+eoeHealthTreatmentReport(t)} :
+          {ok:false,error:t.error};
+      }
+      else if (m[2] && String(m[2]).toUpperCase()==="ATTACK" && String(m[1]).toUpperCase()!=="CREATURE")
+        result={ok:false,error:"Only #DEBUG CREATURE ATTACK can roll an attack."};
+      else if (m[3] && (String(m[1]).toUpperCase()!=="CREATURE" ||
+          String(m[2]).toUpperCase()!=="SPAWN"))
+        result={ok:false,error:"Creature class selection is only allowed on #DEBUG CREATURE SPAWN."};
+      else result=String(m[1]).toUpperCase()==="CREATURE"
+        ? (String(m[2]).toUpperCase()==="ATTACK" ? eoeDebugCreatureAttack(actionId) :
+            eoeDebugCreatureCommand(String(m[2]).toUpperCase(),actionId,m[3] ? String(m[3]).toUpperCase():null))
+        : eoeDebugTrapCommand(String(m[2]).toUpperCase(),actionId);
+    }
+    state.eoeDebugTurn={...result,actionId};
+    if (key!==null) {
+      const ledger=cache || {schemaVersion:1,actions:{},order:[]};
+      ledger.actions[key]={...result};
+      ledger.order.push(key);
+      while (ledger.order.length>64) delete ledger.actions[ledger.order.shift()];
+      state.eoeDebugActionCache=ledger;
+    }
+    return {text};
+  }
+
+  // HP-01C5: exactly one pre-generated mechanical Site trap is script-owned.
+  // Commands cannot be combined with travel, navigation, medical or checks.
+  if (/(?:^|[^A-Z0-9_#])#TRAP(?![A-Z0-9_])/i.test(raw)) {
+    if (state.eoeTrapTurn && actionId!==null &&
+        state.eoeTrapTurn.actionId===actionId) return {text};
+    let result;
+    if ((raw.match(/#[A-Za-z][A-Za-z0-9_]*/g)||[]).length!==1)
+      result={ok:false,error:"Use exactly one #TRAP command per action."};
+    else {
+      const m=raw.match(/^\s*(?:>\s*(?:You\s+)?)?#TRAP(?:[ \t]+(STATUS|EVADE|DISARM))?[.!?]*\s*$/i);
+      if (!m) result={ok:false,error:"Use #TRAP STATUS, #TRAP EVADE, or #TRAP DISARM."};
+      else {
+        const site=state.currentSiteId && state.sites && state.sites[state.currentSiteId];
+        const choice=String(m[1]||"STATUS").toUpperCase();
+        if (choice==="STATUS") {
+          const active=eoeCurrentMechanicalTrap(site);
+          result={ok:true,query:true,message:active
+            ? `SITE TRAP — ${active.location.label}: ${active.trap.status.toUpperCase()}${active.source==="debug"?" (DEBUG)":""}. `+
+              (active.trap.status==="pending"
+                ? "Choose #TRAP EVADE (DEX), #TRAP DISARM (Technology), or leave by a known exit. No damage on discovery."
+                : "Previously resolved; no repeat injury.")
+            : "SITE TRAP — No mechanically supported trap is active at this location."};
+        } else result=eoeResolveSiteMechanicalTrap(site,choice,actionId);
+      }
+    }
+    state.eoeTrapTurn={...result,actionId};
+    return {text};
+  }
+
+  // SKL-01B3: Explicit checks get command precedence over travel/navigation.
+  // One player action creates at most one roll, even if Input is rerun by
+  // Retry. Any other hash command in the same input makes the check invalid;
+  // neither navigation nor travel commands are then permitted to execute.
+  if (eoeSkillCheckCommandPresent(raw)) {
+    if (state.eoeCheckTurn && actionId != null &&
+        state.eoeCheckTurn.actionId === actionId) return {text};
+    const turn=eoeResolveExplicitSkillCheck(raw,actionId);
+    state.eoeCheckTurn=turn;
+    if (turn.ok) {
+      state.eoeLastCheck=turn;  // durable record, not an invitation to reroll
+      log(`SKL ROLL | actor=${turn.actorName} check=${turn.check} die=${turn.result.die} score=${turn.result.score} total=${turn.result.total} success=${turn.result.success} critical=${turn.result.critical||"none"}`);
+    } else log(`SKL REJECT | ${turn.error}`);
+    return {text};
+  }
+
+  /** UNIVERSAL PLAYER HASH COMMANDS — ACT ANYWHERE IN PLAYER INPUT.
+   * AIDungeon Say mode can contain dialogue plus a command, for example:
+   *   > "ok...strap in..." #Liftoff.
+   * Commands are case-insensitive and require complete token boundaries so
+   * #LIFTOFFX / foo#LIFTOFF are not mistaken for commands. Preserve the
+   * player's entire original input; the engine executes only the command.
+   * IMPORTANT: even when mentioned conversationally, recognized #tokens
+   * now execute. Players should avoid typing one unless they mean to use it.
+   */
+  const hashCommandPattern = /(?:^|[^A-Z0-9_#])#(EXPLORE[ \t]*[0-9]+|AUTOSKILL(?:[ \t\r\n]+(?:ON|OFF))?|AUTOEXITS(?:[ \t\r\n]+(?:ON|OFF))?|LAUNCH|LIFTOFF|CONTINUE|RESUME|DEPART|ENTER|EXITS)(?![A-Z0-9_])/gi;
+  const seenCommands = [];
+  let hashMatch;
+  while ((hashMatch = hashCommandPattern.exec(raw)) !== null) {
+    let found = "#" + hashMatch[1].toUpperCase().replace(/\s+/g, " ");
+    // Normalize both #EXPLORE1 and #EXPLORE 1 to the same action.
+    if (/^#EXPLORE [0-9]+$/.test(found)) found = found.replace(" ", "");
+    if (found === "#LAUNCH") found = "#LIFTOFF";
+    if (!seenCommands.includes(found)) seenCommands.push(found);
+  }
+  // One command may be mentioned multiple times, but unrelated commands in
+  // the same action are ambiguous. Reject them rather than choosing at random
+  // or carrying out a dangerous departure/room movement by accident.
+  const command = seenCommands.length === 1 ? seenCommands[0] : "";
+  if (seenCommands.length > 1) {
+    state.atdwCommandNotice = `Multiple commands found (${seenCommands.join(", ")}). Use one distinct #command per action; no command was executed.`;
+    log(`COMMAND CONFLICT | count=${seenCommands.length} commands=${seenCommands.join(",")}`);
+    return { text };
+  }
+  if (seenCommands.length) log(`COMMAND PARSE | recognized=${command}`);
+  if (/#LIFTOFF\b/i.test(raw)) {
+    log(`COMMAND PARSE | liftoffSeen=true recognized=${command === "#LIFTOFF"}`);
+  }
+  // Standalone narrated draw/ready is an equipment change, never an attack.
+  if (!command && !/#\w+/.test(raw) && actionId!==null &&
+      !graphInputHasMovementIntent(input)) {
+    const naturalId=eoeDetectNaturalEquip(raw);
+    if(naturalId){
+      const cache=state.eoeGearActionCache,key=String(actionId);
+      const previous=cache && cache.schemaVersion===1 && cache.actions &&
+        Object.prototype.hasOwnProperty.call(cache.actions,key);
+      const result=previous?cache.actions[key]:
+        cache && (cache.schemaVersion!==1 || !cache.actions || !Array.isArray(cache.order))?
+          {ok:false,error:'Equipment history invalid; no change made.'}:
+          eoeWeaponEquip(EOE_WEAPONS[naturalId].name);
+      state.eoeGearTurn={...result,actionId,source:'NATURAL',weaponId:naturalId};
+      if(!previous) eoeCreatureDirectorTick(actionId,'ROLEPLAY');
+      if(!previous && (!cache || (cache.schemaVersion===1 && cache.actions && Array.isArray(cache.order)))) {
+        const ledger=cache||{schemaVersion:1,actions:{},order:[]};
+        ledger.actions[key]={...result};ledger.order.push(key);
+        while(ledger.order.length>64)delete ledger.actions[ledger.order.shift()];
+        state.eoeGearActionCache=ledger;
+      }
+      return {text};
+    }
+  }
+  // CBT-01D4: nonlethal natural-language evasion takes priority over
+  // generic exploration movement and stealth checks during active combat.
+  if (!command && !/#\w+/.test(raw) && actionId!==null &&
+      eoeDebugCreatureAtLocation()) {
+    const intent=eoeDetectEvasionIntent(raw);
+    if(intent){
+      const ledger=eoeEvasionLedger(),key=String(actionId);
+      const previous=ledger && Object.prototype.hasOwnProperty.call(ledger.actions,key);
+      const outcome=!ledger?{ok:false,error:'Evasion ledger invalid; no roll.'}:
+        previous?ledger.actions[key]:eoeResolveEvasion(intent,actionId);
+      state.eoeEvasionTurn={...outcome,actionId};
+      if(ledger&&!previous){
+        ledger.actions[key]={...outcome};ledger.order.push(key);
+        while(ledger.order.length>64)delete ledger.actions[ledger.order.shift()];
+      }
+      // Failed concealment or disengagement leaves the creature free to act.
+      // Successful attempts are one complete beat without free retaliation.
+      if(outcome.ok && !outcome.success && !previous)
+        eoeCreatureDirectorTick(actionId,'PLAYER_EVASION_FAILED');
+      return {text};
+    }
+  }
+  // CBT-01D1: the player can attack a supported local test creature in
+  // natural language. #commands / graph movement always retain priority.
+  // Old Retry results are read from ledger and NEVER reroll or re-consume.
+  if (!command && !/#\w+/.test(raw) && actionId!==null &&
+      state.eoePlayerProfile && state.eoePlayerProfile.kind==='PC' &&
+      !graphInputHasMovementIntent(input) && (eoeDebugCreatureAtLocation() ||
+       (state.eoeCombatActionCache && state.eoeCombatActionCache.actions &&
+        Object.prototype.hasOwnProperty.call(state.eoeCombatActionCache.actions,String(actionId))))) {
+    const cache=state.eoeCombatActionCache;const key=String(actionId);
+    if (cache && cache.schemaVersion===1 && cache.actions &&
+        Object.prototype.hasOwnProperty.call(cache.actions,key)) {
+      state.eoeCombatTurn={...cache.actions[key],actionId};return {text};
+    }
+    const detected=eoeDetectCombatAttempt(raw);
+    if(detected){
+      const result=cache && (cache.schemaVersion!==1 || !cache.actions || !Array.isArray(cache.order))
+        ? {ok:false,error:'Combat action history invalid; no roll.'}
+        : eoeResolveCombatAttempt(detected,actionId);
+      state.eoeCombatTurn={...result,actionId};
+      if (!cache || (cache.schemaVersion===1 && cache.actions && Array.isArray(cache.order))) {
+        const ledger=cache || {schemaVersion:1,actions:{},order:[]};
+        ledger.actions[key]={...result};ledger.order.push(key);
+        while(ledger.order.length>64)delete ledger.actions[ledger.order.shift()];
+        state.eoeCombatActionCache=ledger;
+      }
+      log(`CBT MODE2 | action=${actionId} result=${result.ok?(result.hit?'HIT':'MISS'):'REJECT'} weapon=${detected.weaponId||'none'} hiddenBonus=${result.hiddenAttackBonus||0} revealed=${!!result.hiddenAtAttack} wound=${result.creatureWoundApplied||0} hp=${result.creatureWoundsRemaining===undefined?'?':result.creatureWoundsRemaining}/${result.creatureMaxWounds===undefined?'?':result.creatureMaxWounds} dead=${!!result.creatureDead}`);
+      if(result.ok && !result.creatureDead) eoeCreatureDirectorTick(actionId,'PLAYER_ATTACK');
+      return {text};
+    }
+  }
+  // SKL-01D: Conservative implicit resolution for actual player attempts.
+  // Do not intercept any #command, player setup, or room-navigation intent.
+  // A numeric action ID is mandatory here so Input Retry cannot reroll.
+  // Missing profiles and uncertain classifications simply pass to the AI.
+  if (!command && !/#\w+/.test(raw) && actionId !== null &&
+      state.eoeImplicitSkillsEnabled !== false &&
+      state.eoePlayerProfile && state.eoePlayerProfile.kind === "PC" &&
+      !graphInputHasMovementIntent(input)) {
+    const detected=eoeDetectImplicitSkillCheckRequest(raw);
+    if (detected) {
+      if (state.eoeCheckTurn && state.eoeCheckTurn.actionId===actionId)
+        return {text};
+      const turn=eoeResolveImplicitSkillCheck(raw,actionId,detected);
+      if (turn) {
+        const previousSite=state.currentSiteId && state.sites && state.sites[state.currentSiteId];
+        if (previousSite && previousSite.mode==="EXPLORING_ACTIVE") {
+          previousSite.navigationPending=null;
+          previousSite.exitsStandalone=false;
+        }
+        state.eoeCheckTurn=turn;
+        state.eoeLastCheck=turn;
+        log(`SKL IMPLICIT | actor=Player check=${turn.check} die=${turn.result.die} score=${turn.result.score} total=${turn.result.total} success=${turn.result.success}`);
+        eoeCreatureDirectorTick(actionId,'ROLEPLAY');
+        return {text};
+      }
+    }
+  }
+  const site = state.currentSiteId ? state.sites[state.currentSiteId] : null;
+  // Resume old saved sites without rerolling any of their interior rooms.
+  if (site && site.nodes) atdwEnsureShipNode(site);
+  if (command.startsWith("#AUTOSKILL")) {
+    if (command==="#AUTOSKILL ON") state.eoeImplicitSkillsEnabled=true;
+    if (command==="#AUTOSKILL OFF") state.eoeImplicitSkillsEnabled=false;
+    state.atdwCommandNotice=`Implicit skill checks: ${state.eoeImplicitSkillsEnabled ? "ON" : "OFF"}. Explicit #skillcheck remains available.`;
+    log(`AUTOSKILL | enabled=${state.eoeImplicitSkillsEnabled}`);
+    return {text};
+  }
+  if (command.startsWith("#AUTOEXITS")) {
+    if (command === "#AUTOEXITS ON") state.atdwSettings.autoExits = true;
+    if (command === "#AUTOEXITS OFF") state.atdwSettings.autoExits = false;
+    // Showing the full list NOW makes the toggle immediately verifiable.
+    // A standalone setting command is also an observation-only request:
+    // the AI cannot substitute movement narration for the exit menu.
+    if (command === "#AUTOEXITS ON" && site && site.nodes && site.mode === "EXPLORING_ACTIVE") {
+      site.showExits = true;
+      site.exitsLookOnly = true;
+      site.exitsStandalone = /^\s*(?:>\s*(?:You\s+)?)?#AUTOEXITS[ \t]+ON[.!?]*\s*$/i.test(raw);
+    }
+    state.atdwCommandNotice = `Automatic inline exits: ${state.atdwSettings.autoExits ? "ON" : "OFF"}. #EXITS is always available.`;
+    log(`AUTO EXITS | enabled=${state.atdwSettings.autoExits}`);
+    return { text };
+  }
+  // Upgrade older Site saves once, preserving generated creatures and cards.
+  if (site && site.nodes) migrateGraphEncounterState(site);
+
+  // ========================================================================
+  /** GENERATE SITE ON ARRIVAL
+   * Rolls the original arrival table once, rolls the complete area contents,
+   * then connects those areas into a persistent, traversable graph.
+   * The crew remains aboard its ship until #ENTER / natural entry.
+   */
+  // ========================================================================
+  const completeArrival = () => {
+    if (travel.siteGenerated) return;
+    travel.siteGenerated = true;
+    const result = generateSiteArrival();
+    state.lastArrivalResult = result.arrival.result;
+    log(`ARRIVAL | day=${travel.currentDay}/${travel.tripLength} roll=${result.arrival.roll} | ${result.arrival.result}`);
+    if (result.arrival.fatal) { travel.phase = "fatal"; return; }
+    if (!result.site) { travel.phase = "no_site"; return; }
+
+    const siteId = `site_${String(state.nextSiteId).padStart(3, "0")}`;
+    state.nextSiteId++;
+    const blueprint = generateSiteBlueprint(result.site);
+    const graph = buildSiteGraph(result.site, blueprint);
+    state.sites[siteId] = {
+      siteId,
+      name: result.site.name,
+      purpose: result.site.purpose,
+      background: result.site.background,
+      description: result.site.description,
+      hazard: result.site.hazard,
+      size: result.site.size,
+      arrivalType: result.arrival.result,
+      shipId: state.eoeCurrentShip ? state.eoeCurrentShip.id : null,
+      shipName: state.eoeCurrentShip ? state.eoeCurrentShip.name : null,
+      arrivalScene: atdwArrivalSeed(result.site, result.arrival.result),
+      ...graph
+    };
+    // Node 0 belongs to the specific craft which brought the crew here.
+    if (state.eoeCurrentShip)
+      state.sites[siteId].nodes["0"].roomScene = `${state.eoeCurrentShip.name} is berthed outside the Site. Its closed hatch is the sole connection to Area 1.`;
+    // Creatures are generated here; register stable health IDs now while
+    // keeping their numerical Wound capacities unrated for the combat phase.
+    eoeEnsureSiteCreatureHealth(state.sites[siteId]);
+    state.currentSiteId = siteId;
+    state.currentAreaId = 0; // physically aboard special Node 0
+    state.siteCurrentlyGenerated = true;
+    state.siteExplorationActive = false; // only true after entry
+    state.currentSiteExploration = null;
+    state.siteExplorationCount = 0;
+    travel.phase = "arrived";
+    log(`NEW SITE | ${siteId} ${result.site.name} size=${result.site.size} areas=${graph.totalAreas}`);
+    log(formatGraphDebug(state.sites[siteId]));
+    log(`GRAPH STATE SIZE | ${siteId} bytes=${JSON.stringify(state.sites[siteId]).length}`);
+  };
+
+  // ========================================================================
+  /** EVENT-DRIVEN TRAVEL CHECKPOINTS
+   * Arrival and event scheduling are still authoritative JS operations.
+   * Normal travel roleplay is open-ended. Only #CONTINUE moves the story to
+   * the fixed event day; a further #CONTINUE concludes it and arrives.
+   * The AI cannot move the clock or reroll a queued event.
+   */
+  // ========================================================================
+  const enterDay = () => {
+    travel.dayNeedsNarration = true;
+    travel.dayActions = 0;             // historical counter, not a timer
+    travel.dayPromptDue = false;       // retired auto reminder
+    travel.eventRoleplayActions = 0;
+    if (travel.currentDay === travel.eventDay && !travel.eventTriggered) {
+      travel.eventTriggered = true;
+      travel.phase = "event";
+      // HP-01C4: one fixed event has one fixed damage effect; other event
+      // table entries cannot cause Wounds until individually implemented.
+      if (travel.event===EOE_TOOL_FALL_EVENT) {
+        const result=eoeResolveToolFallHazard(travel,actionId);
+        if (!result.ok) log(`TRAVEL TOOL FALL NOT APPLIED | ${result.error}`);
+      }
+      log(`TRAVEL EVENT CHECKPOINT | day=${travel.currentDay}/${travel.tripLength} | EVENT=${travel.event}`);
+    } else {
+      travel.phase = "traveling";
+      log(`TRAVEL DAY | ${travel.currentDay}/${travel.tripLength} | normal`);
+    }
+  };
+
+  /** Resolve a skipped event with 1–3 ACTUAL named NPCs, never the player.
+   * Two NPCs are normally available. No invented crew identities or player
+   * actions, and no pretend bookkeeping for resources not modeled in JS.
+   * Quality and additional cost severity are independent d10 results;
+   * mandatory consequences stated in the original event remain binding.
+   */
+  const autoResolveTravelEvent = () => {
+    if (travel.eventResolved) return;
+    // Missing name placeholders do not erase the two established NPC slots.
+    // Role labels are safe fallbacks, not invented character identities.
+    const candidates = [
+      getPlaceholder("crew #2 name") || "Crew member #2",
+      getPlaceholder("crew #3 name") || "Crew member #3"
+    ].filter((name, i, all) => all.indexOf(name) === i);
+    const count = candidates.length ? 1 + Math.floor(Math.random() * Math.min(3, candidates.length)) : 0;
+    const pool = candidates.slice();
+    const responders = [];
+    for (let i = 0; i < count; i++) {
+      const choice = Math.floor(Math.random() * pool.length);
+      responders.push(pool.splice(choice, 1)[0]);
+    }
+    const quality = Math.floor(Math.random() * 10) + 1;
+    const costSeverity = Math.floor(Math.random() * 10) + 1;
+    travel.eventResolution = {
+      mode: "NPC_AUTO", responders, quality, costSeverity,
+      roleplayActions: travel.eventRoleplayActions || 0,
+      event: travel.event
+    };
+    travel.eventResolved = true;
+    travel.autoResolutionPendingNarration = true;
+    log(`EVENT AUTO RESOLVED | day=${travel.currentDay} responders=${responders.join(",") || "none"} quality=${quality}/10 cost=${costSeverity}/10 rp=${travel.eventRoleplayActions || 0}`);
+  };
+
+  // ========================================================================
+  /** Return voyage shares the tested two-checkpoint travel engine, but ends
+   * at Azaheim rather than generating a new procedural destination.
+   */
+  const startReturnVoyage = (fromSite) => {
+    const t = emptyTravel();
+    t.direction = "return";
+    t.originSiteId = fromSite.siteId;
+    t.shipId = fromSite.shipId || (state.eoeCurrentShip && state.eoeCurrentShip.id) || null;
+    t.phase = "traveling";
+    t.currentDay = 1;
+    t.tripLength = Math.floor(Math.random() * 6) + 2;
+    t.eventDay = Math.floor(Math.random() * (t.tripLength - 1)) + 2;
+    t.event = generateTravelEvent();
+    t.dayNeedsNarration = true;
+    state.travel = t;
+    travel = t;
+    atdwResetTurnReminder("travel");
+    log(`RETURN JOURNEY | site=${fromSite.siteId} length=${t.tripLength} eventDay=${t.eventDay}`);
+  };
+
+  // ========================================================================
+  /** COMMAND HANDLERS — TRAVEL
+   * Explicit commands override story-text guesses. A Site is never erased
+   * when the crew departs. Fatal arrival remains terminal.
+   */
+  // ========================================================================
+  if (command === "#DEPART") {
+    if (!site || site.mode !== "AT_SHIP" || Number(site.currentAreaId) !== 0 || travel.phase !== "exploring") {
+      state.atdwCommandNotice = "DEPART BLOCKED: Return aboard the Eirseid ship (Node 0) through Area 1 before using #DEPART.";
+      log(`DEPART BLOCKED | phase=${travel.phase} room=${site ? site.currentAreaId : "none"} mode=${site ? site.mode : "none"}`);
+      return { text };
+    }
+    eoeArchiveSiteInhabitants(site);
+    site.mode = "LEFT";
+    site.navigationPending = null;
+    site.entryPending = false;
+    site.showExits = false;
+    state.lastCompletedSiteId = site.siteId;
+    state.currentSiteId = null;
+    state.currentAreaId = null;
+    state.siteCurrentlyGenerated = false;
+    state.siteExplorationActive = false;
+    state.currentSiteExploration = null;
+    state.siteExplorationCount = 0;
+    startReturnVoyage(site);
+    log(`DEPART | saved=${site.siteId} visited=${Object.values(site.nodes).filter(n => n.areaId !== 0 && n.visited).length}/${site.totalAreas} return=true`);
+    return { text };
+  }
+
+  if (command === "#LIFTOFF") {
+    if ((travel.phase !== "idle" && travel.phase !== "no_site") || site) {
+      log(`LIFTOFF BLOCKED | phase=${travel.phase} site=${!!site}`); return { text };
+    }
+    const assignedShip = state.eoeShipAwaitingLaunch && state.eoeCurrentShip
+      ? state.eoeCurrentShip : eoeAssignShipToOutboundExpedition();
+    if (!assignedShip) {
+      state.atdwCommandNotice = "Ship assignment failed. No launch occurred; review Story Card logs.";
+      return { text };
+    }
+    state.eoeShipAwaitingLaunch = false;
+    state.travel = {
+      phase: "traveling", direction: "outbound", shipId: assignedShip.id, currentDay: 1,
+      tripLength: Math.floor(Math.random() * 6) + 2, // 2–7 days
+      eventDay: 0, event: generateTravelEvent(),
+      eventTriggered: false, eventResolved: false,
+      siteGenerated: false, dayNeedsNarration: true,
+      dayActions: 0, dayPromptDue: false,
+      eventRoleplayActions: 0, eventResolution: null,
+      autoResolutionPendingNarration: false
+    };
+    travel = state.travel;
+    travel.eventDay = Math.floor(Math.random() * (travel.tripLength - 1)) + 2;
+    state.travelEventThisTrip = false;
+    state.travelEventDelivered = true;
+    state.travelEvent = null;
+    atdwResetTurnReminder("travel");
+    log(`NEW JOURNEY | length=${travel.tripLength} eventDay=${travel.eventDay}`);
+    enterDay();
+    return { text };
+  }
+
+  // HP-01C4: retries must not advance a two-step #CONTINUE journey
+  // twice on one action ID (especially from freshly triggered event to
+  // auto-resolution). A new action ID is required for the second checkpoint.
+  if ((command==="#CONTINUE" || command==="#RESUME") && actionId!==null &&
+      travel.lastContinueActionId===actionId) {
+    log(`TRAVEL CONTINUE RETRY | action=${actionId} phase=${travel.phase}`);
+    return {text};
+  }
+  if (command === "#CONTINUE" && travel.phase === "traveling") {
+    if (actionId!==null) travel.lastContinueActionId=actionId;
+    // Jump across all uneventful days. No intermediate narration or event
+    // rerolls; the one event day was preselected on liftoff.
+    travel.currentDay = travel.eventDay;
+    enterDay();
+    atdwResetTurnReminder("travel");
+    return { text };
+  }
+
+  if (command === "#CONTINUE" || command === "#RESUME") {
+    if (travel.phase !== "event") {
+      log(`${command === "#RESUME" ? "RESUME" : "CONTINUE"} BLOCKED | phase=${travel.phase} day=${travel.currentDay}`);
+      return { text };
+    }
+    if (command === "#RESUME") log("RESUME COMPAT | use #CONTINUE in event-driven travel");
+    if (actionId!==null) travel.lastContinueActionId=actionId;
+    autoResolveTravelEvent();
+    // A completed event is the final narrative checkpoint. Advance the
+    // calendar to the journey's end and generate the arrival only once.
+    travel.currentDay = travel.tripLength;
+    travel.dayNeedsNarration = true;
+    if (travel.direction === "return") {
+      travel.phase = "home"; // narrative Azaheim arrival; OUTPUT restores idle
+      state.lastHomeArrival = { fromSiteId: travel.originSiteId, day: travel.currentDay };
+      log(`HOME ARRIVAL | from=${travel.originSiteId} day=${travel.currentDay}/${travel.tripLength}`);
+    } else completeArrival();
+    atdwResetTurnReminder("travel");
+    return { text };
+  }
+
+  // ========================================================================
+  /** SITE ENTRY — strictly command-authorized.
+   * There is no natural-language/AI entry while aboard Node 0. Both a new
+   * arrival and re-entry after boarding obey the same #ENTER gate.
+   */
+  // ========================================================================
+  if (site && site.nodes && site.mode === "AT_SHIP" && travel.phase === "exploring") {
+    site.entryPending = false;
+    if (command === "#ENTER") enterGraphSite(site, "COMMAND");
+    else if (command === "#EXITS") {
+      state.atdwCommandNotice = "Aboard Node 0 — Eirseid ship. Use #ENTER to cross the docking hatch into Area 1, or #DEPART to begin the return voyage.";
+    }
+    return { text };
+  }
+
+  // ========================================================================
+  /** GRAPH NAVIGATION
+   * INPUT recognizes a precise #EXPLORE<number> first, then high-confidence
+   * natural movement. Ambiguous traversal is only prepared for AI assessment;
+   * it is never committed until OUTPUT verifies a valid movement marker.
+   */
+  // ========================================================================
+  if (site && site.nodes && site.mode === "EXPLORING_ACTIVE") {
+    site.navigationPending = null; // do not accept a stale AI marker
+    site.exitsStandalone = false; // never inherit a previous pure-query flag
+    if (command === "#EXITS") {
+      // One-turn signal for CONTEXT. The menu is authoritative, but the
+      // storyteller also needs to know this was observation, not traversal.
+      site.exitsLookOnly = true;
+      site.exitsStandalone = /^\s*(?:>\s*(?:You\s+)?)?#EXITS[.!?]*\s*$/i.test(raw);
+      site.showExits = true;
+      log(`NAV LOOK | room=${site.currentAreaId} exits=${getSiteExits(site).length}`);
+      return { text };
+    }
+    const explore = command.match(/^#EXPLORE(\d+)$/);
+    if (explore) {
+      const number = Number(explore[1]);
+      log(`NAV COMMAND | room=${site.currentAreaId} exit=${number}`);
+      if (!commitGraphMovement(site, number, "COMMAND")) {
+        site.navWarning = `Exit ${number} is not available. Type #EXITS for valid exits.`;
+        site.showExits = true;
+      }
+      return { text };
+    }
+    if (command) return { text };
+
+    const intent = graphInputHasMovementIntent(input);
+    if (!intent) {
+      // Combat, negotiation and other local actions belong to the narrator.
+      log(`NAV STAY | room=${site.currentAreaId} (no movement intent)`);
+      if (!/#\w+/.test(raw) && input.trim()) eoeCreatureDirectorTick(actionId,'ROLEPLAY');
+      return { text };
+    }
+    const scores = scoreGraphExitMatches(input, site);
+    const best = scores[0];
+    const runnerUp = scores[1];
+    const scoreLog = scores.map(x => `${x.number}:${x.score}`).join(",");
+    log(`NAV SCORE | room=${site.currentAreaId} exits=[${scoreLog}] input=${input.slice(0, 85)}`);
+
+    // Strong ordinal phrasing from a natural action: "take exit 2".
+    const ordinal = input.match(/\b(?:exit|option|passage|route|path)\s*(\d+)\b/i);
+    if (ordinal) {
+      const number = Number(ordinal[1]);
+      if (commitGraphMovement(site, number, "NATURAL-NUMBER")) return { text };
+      site.navWarning = `Exit ${number} is not available.`;
+      site.showExits = true;
+      return { text };
+    }
+
+    if (best && best.score >= 3 && (!runnerUp || best.score - runnerUp.score >= 2)) {
+      if (commitGraphMovement(site, best.number, "KEYWORDS")) return { text };
+    }
+    // AI sees actual authorized adjacent destinations, not arbitrary areas.
+    const allowed = getSiteExits(site)
+      .filter(e => !e.status.locked && !e.status.blocked && graphExitDirectionCompatible(e, input))
+      .map(e => e.number);
+    if (!allowed.length) {
+      site.navWarning = "No available exit matches that movement. Type #EXITS to see your options.";
+      site.showExits = true;
+      log(`NAV BLOCK | no direction-compatible exits room=${site.currentAreaId}`);
+      return { text };
+    }
+    site.navigationPending = {
+      from: site.currentAreaId,
+      allowed,
+      playerInput: input.slice(0, 220)
+    };
+    log(`NAV AI PENDING | from=${site.currentAreaId} allowed=${allowed.join(",")}`);
+  }
+  // ========================================================================
+  /** OPTIONAL SHIPBOARD ROLEPLAY
+   * Player actions never trigger automatic day changes. During an event,
+   * record only the count of voluntary interactions as a narration hint;
+   * do not infer success, select player actions, or auto-resolve the event.
+   */
+  // ========================================================================
+  if (!command && input.length > 0) {
+    if (travel.phase === "traveling") travel.dayActions = (travel.dayActions || 0) + 1;
+    if (travel.phase === "event") travel.eventRoleplayActions = (travel.eventRoleplayActions || 0) + 1;
+  }
+  if (!command && !/#\w+/.test(raw) && input.trim() &&
+      !graphInputHasMovementIntent(input)) eoeCreatureDirectorTick(actionId,'ROLEPLAY');
+  return { text };
+};
+modifier(text);
