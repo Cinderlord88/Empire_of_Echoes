@@ -1,8 +1,8 @@
 /**
  * EMPIRE OF ECHOES — INPUT
- * Version: 0.10.0-alpha.17
+ * Version: 0.10.0-alpha.23
  * Script: Input
- * Release: CBT-01D6 — Intent Detection & Species Registry
+ * Release: Autonomous Site Encounters
  * Save Schema: 1
  * Health Schema: 1
  */
@@ -93,7 +93,9 @@ const modifier = (text) => {
   // CBT-01D1: idempotently provide the 9mm sidearm and combat knife from
   // the scenario's standard-issue kit. Never reset owned/lost weapons.
   eoeWeaponInventory();
-  // CBT-01D6: migrate only creatures currently encountered/visible.
+  eoeEconomyStore();
+  if(eoeEconomyHome())eoeEconomyDock();
+  // ECO-01: migrate only creatures currently encountered/visible.
   eoeEnsureVisibleCreatureSpecies();
   if (state.eoeImplicitSkillsEnabled === undefined)
     state.eoeImplicitSkillsEnabled = ATDW_SETTINGS.IMPLICIT_SKILL_CHECKS_DEFAULT !== false;
@@ -305,6 +307,51 @@ const modifier = (text) => {
     return {text};
   }
 
+  // ECO-01: shared explicit/natural economy detector; first actionable intent only.
+  // Script controls acquisition, capacity, ownership, money and scarcity.
+  // Deliberately does not infer loot from AI narrative or run on Continue.
+  {
+    const rawEconomy=raw.trim().replace(/^>\s*(?:You\s+)?/i,'').trim();
+    const explicit=rawEconomy.match(/^#(INVENTORY|CREDITS|SALVAGE|SHOP|COLLECT|TAKE|STOW|SELL|BUY)(?:[ \t]+(.+?))?[.!?]*$/i);
+    let natural=!explicit&&!/#\w+/.test(raw)?eoeEconomyDetectNatural(raw):null;
+    // An ordinary "grab a ladder" or "pick up a wrench" is NOT a salvage
+    // acquisition unless a known room lot matches or Eirseid loot is named.
+    if(natural && natural.op==='COLLECT' &&
+       !/\b(?:crystals?|alloy|cubes?|artifact|salvage|loot|eirseid)\b/i.test(raw)){
+      const where=eoeEconomySite(),room=where&&where.nodes&&where.nodes[where.currentAreaId];
+      const available=room?eoeEconomyLots().filter(l=>l.room>0&&l.siteId===where.siteId&&l.areaId===room.areaId):[];
+      if(eoeEconomyMatch(natural.target,available).length!==1)natural=null;
+    }
+    if(explicit||natural){
+      const op=explicit?explicit[1].toUpperCase():natural.op;
+      const operation=op==='TAKE'?'COLLECT':op;
+      let target=explicit?String(explicit[2]||'').trim():natural.target;
+      let quantity=explicit?null:natural.quantity;
+      if(explicit&&['COLLECT','STOW','SELL','BUY'].includes(operation)){
+        const final=target.match(/^(.+?)[ \t]+(?:X)?(\d+)$/i);
+        const leading=target.match(/^(\d+)[ \t]+(.+)$/);
+        if(leading){quantity=Number(leading[1]);target=leading[2];}
+        else if(final){quantity=Number(final[2]);target=final[1];}
+      }
+      if(!target&&['COLLECT','STOW','SELL'].includes(operation))target='all';
+      const conflict=(raw.match(/#[A-Za-z][A-Za-z0-9_]*/g)||[]).length>(explicit?1:0);
+      const result=conflict?{ok:false,error:'One explicit command per action; no economy action taken.'}:
+        eoeEconomyExecute(operation,target,quantity,actionId,explicit?'EXPLICIT':'NATURAL');
+      state.eoeEconomyTurn={...result,actionId,source:explicit?'EXPLICIT':'NATURAL'};
+      return {text};
+    }
+    if(/(?:^|[^A-Z0-9_#])#(?:INVENTORY|CREDITS|SALVAGE|SHOP|COLLECT|TAKE|STOW|SELL|BUY)(?![A-Z0-9_])/i.test(raw)){
+      state.eoeEconomyTurn={ok:false,error:'Use one standalone economy command; no action taken.',actionId};
+      return {text};
+    }
+  }
+
+  // NCI-01: Read-only natural encounter status. No creature activation or RNG.
+  if(/^\s*(?:>\s*(?:You\s+)?)?#ENCOUNTER[.!?]*\s*$/i.test(raw)){
+    state.eoeEncounterTurn={actionId,ok:true,message:eoeNaturalCreatureStatus()};
+    return {text};
+  }
+
   // CBT-01D1: small, one-command equipment interface; never invent a weapon.
   if (/(?:^|[^A-Z0-9_#])#(?:GEAR|EQUIP)(?![A-Z0-9_])/i.test(raw)) {
     if (state.eoeGearTurn && actionId!==null && state.eoeGearTurn.actionId===actionId) return {text};
@@ -333,9 +380,10 @@ const modifier = (text) => {
     state.eoeGearTurn={...result,actionId};return {text};
   }
 
-  // CBT-01C: one standalone combat difficulty command; plain #COMMANDS
+  // CBT-01C/NAV-08: one standalone difficulty or help command; #HELP and
+  // #COMMANDS are interchangeable read-only references.
   // works even when another triggerless Story Card blocks the quick-reference.
-  if (/(?:^|[^A-Z0-9_#])#(?:COMBAT|COMMANDS)(?![A-Z0-9_])/i.test(raw)) {
+  if (/(?:^|[^A-Z0-9_#])#(?:COMBAT|COMMANDS|HELP)(?![A-Z0-9_])/i.test(raw)) {
     if (state.eoeCombatDifficultyTurn && actionId!==null &&
         state.eoeCombatDifficultyTurn.actionId===actionId) return {text};
     const cache=state.eoeCombatDifficultyActionCache;
@@ -350,8 +398,8 @@ const modifier = (text) => {
     } else if (actionId===null) {
       result={ok:false,error:"Difficulty command requires a stable action ID."};
     } else if ((raw.match(/#[A-Za-z][A-Za-z0-9_]*/g)||[]).length!==1) {
-      result={ok:false,error:"Use one standalone #COMBAT DIFFICULTY or #COMMANDS command."};
-    } else if (/^(?:>\s*(?:You\s+)?)?#COMMANDS[.!?]*$/i.test(input)) {
+      result={ok:false,error:"Use one standalone #COMBAT DIFFICULTY, #HELP, or #COMMANDS command."};
+    } else if (/^(?:>\s*(?:You\s+)?)?#(?:COMMANDS|HELP)[.!?]*$/i.test(input)) {
       result={ok:true,message:atdwCommandCardText()};
     } else {
       const match=input.match(/^(?:>\s*(?:You\s+)?)?#COMBAT[ \t]+DIFFICULTY(?:[ \t]+([1-5]))?[.!?]*$/i);
@@ -395,7 +443,7 @@ const modifier = (text) => {
       const m=auto?null:input.match(/^(?:>\s*(?:You\s+)?)?#DEBUG(?:[ \t]+(?:(TRAP|CREATURE)[ \t]+(SPAWN|CLEAR|STATUS|ATTACK)(?:[ \t]+(BRUTE|LURKER|RANGED|SWARM|PSYCHIC))?|(MEDKIT)[ \t]+(REFILL)|(TREAT)[ \t]+(SUCCESS)|(RANGE)[ \t]+(STATUS|AT_RANGE|ENGAGED)))?[.!?]*$/i);
       if (auto) result=eoeCreatureDirectorCommand(auto[1].toUpperCase(),actionId);
       else if (!m) result={ok:false,error:"Use #DEBUG CREATURE AUTO ON/OFF/STATUS, #DEBUG CREATURE SPAWN/STATUS/CLEAR/ATTACK, #DEBUG RANGE STATUS/AT_RANGE/ENGAGED, #DEBUG TRAP, #DEBUG MEDKIT, or #DEBUG TREAT."};
-      else if (!m[1] && !m[4] && !m[6] && !m[8]) result={ok:true,message:"DEBUG COMMANDS — #DEBUG CREATURE AUTO ON/OFF/STATUS; #DEBUG TRAP SPAWN/CLEAR/STATUS; #DEBUG CREATURE SPAWN [BRUTE|LURKER|RANGED|SWARM|PSYCHIC], CLEAR, STATUS; #DEBUG CREATURE ATTACK; #DEBUG RANGE STATUS/AT_RANGE/ENGAGED; #DEBUG MEDKIT REFILL; #DEBUG TREAT SUCCESS. Range commands change only test fixture engagement, and player rifle attacks are not implemented. Director auto-combat is OFF by default, enables via #DEBUG CREATURE AUTO ON, and uses provisional one-Wound-on-hit rules."};
+      else if (!m[1] && !m[4] && !m[6] && !m[8]) result={ok:true,message:"DEBUG COMMANDS — #DEBUG CREATURE AUTO ON/OFF/STATUS; #DEBUG TRAP SPAWN/CLEAR/STATUS; #DEBUG CREATURE SPAWN [BRUTE|LURKER|RANGED|SWARM|PSYCHIC], CLEAR, STATUS; #DEBUG CREATURE ATTACK; #DEBUG RANGE STATUS/AT_RANGE/ENGAGED; #DEBUG MEDKIT REFILL; #DEBUG TREAT SUCCESS. Range commands change only test fixture engagement, and Ranged Combat specialists may carry rifles. Director auto-combat is OFF by default, enables via #DEBUG CREATURE AUTO ON, and uses provisional one-Wound-on-hit rules."};
       else if (m[8]) result=eoeDebugRangeCommand(String(m[9]).toUpperCase(),actionId);
       else if (m[4]) result=eoeMedicalDebugRefill();
       else if (m[6]) {
@@ -492,7 +540,16 @@ const modifier = (text) => {
   // One command may be mentioned multiple times, but unrelated commands in
   // the same action are ambiguous. Reject them rather than choosing at random
   // or carrying out a dangerous departure/room movement by accident.
-  const command = seenCommands.length === 1 ? seenCommands[0] : "";
+  const plainAction = input.replace(/^>\s*(?:You\s+)?/i, "").replace(/[.!]+$/, "");
+  const expeditionActions = [
+    [/^(?:i |we )?(?:launch(?: the ship)?|lift off|depart Azaheim)$/i, "#LIFTOFF"],
+    [/^(?:i |we )?(?:enter the site|cross the docking hatch(?: into the site)?)$/i, "#ENTER"],
+    [/^(?:i |we )?(?:depart the site|return to Azaheim|begin the return voyage)$/i, "#DEPART"],
+    [/^(?:i |we )?(?:continue|resume) (?:the voyage|the journey)$/i, "#CONTINUE"],
+    [/^(?:i )?(?:inspect|check|look at) (?:the )?(?:exits|passages)$/i, "#EXITS"]
+  ];
+  const naturalCommand = !/#/.test(input) && expeditionActions.find(([pattern]) => pattern.test(plainAction))?.[1];
+  const command = seenCommands.length === 1 ? seenCommands[0] : naturalCommand || "";
   if (seenCommands.length > 1) {
     state.atdwCommandNotice = `Multiple commands found (${seenCommands.join(", ")}). Use one distinct #command per action; no command was executed.`;
     log(`COMMAND CONFLICT | count=${seenCommands.length} commands=${seenCommands.join(",")}`);
@@ -525,10 +582,10 @@ const modifier = (text) => {
       return {text};
     }
   }
-  // CBT-01D4: nonlethal natural-language evasion takes priority over
-  // generic exploration movement and stealth checks during active combat.
+  // CBT-01D4/NCI-01: nonlethal natural-language evasion takes priority over
+  // generic exploration movement and stealth checks during local combat.
   if (!command && !/#\w+/.test(raw) && actionId!==null &&
-      eoeDebugCreatureAtLocation()) {
+      eoeCombatCreatureAtLocation()) {
     const intent=eoeDetectEvasionIntent(raw);
     if(intent){
       const ledger=eoeEvasionLedger(),key=String(actionId);
@@ -547,12 +604,12 @@ const modifier = (text) => {
       return {text};
     }
   }
-  // CBT-01D1: the player can attack a supported local test creature in
-  // natural language. #commands / graph movement always retain priority.
+  // CBT-01D1/NCI-01: the player can attack a rated creature in this room
+  // (test fixture or naturally encountered Site specimen) in natural language. #commands / graph movement always retain priority.
   // Old Retry results are read from ledger and NEVER reroll or re-consume.
   if (!command && !/#\w+/.test(raw) && actionId!==null &&
       state.eoePlayerProfile && state.eoePlayerProfile.kind==='PC' &&
-      !graphInputHasMovementIntent(input) && (eoeDebugCreatureAtLocation() ||
+      !graphInputHasMovementIntent(input) && (eoeCombatCreatureAtLocation() ||
        (state.eoeCombatActionCache && state.eoeCombatActionCache.actions &&
         Object.prototype.hasOwnProperty.call(state.eoeCombatActionCache.actions,String(actionId))))) {
     const cache=state.eoeCombatActionCache;const key=String(actionId);
@@ -584,7 +641,8 @@ const modifier = (text) => {
   if (!command && !/#\w+/.test(raw) && actionId !== null &&
       state.eoeImplicitSkillsEnabled !== false &&
       state.eoePlayerProfile && state.eoePlayerProfile.kind === "PC" &&
-      !graphInputHasMovementIntent(input)) {
+      (!graphInputHasMovementIntent(input) ||
+        /^\s*(?:i\s+)?(?:try to |attempt to )?(?:climb|scale|scramble)\s+(?:the\s+|a\s+)?(?:wall|ladder|cliff|shaft|ledge|rock|slope|rubble)\b|^\s*i\s+use\s+(?:my|the)\s+climbing\s+kit\s+to\s+(?:climb|scale|scramble)\b/i.test(input))) {
     const detected=eoeDetectImplicitSkillCheckRequest(raw);
     if (detected) {
       if (state.eoeCheckTurn && state.eoeCheckTurn.actionId===actionId)
@@ -607,6 +665,14 @@ const modifier = (text) => {
   const site = state.currentSiteId ? state.sites[state.currentSiteId] : null;
   // Resume old saved sites without rerolling any of their interior rooms.
   if (site && site.nodes) atdwEnsureShipNode(site);
+  const salvageOrder = plainAction;
+  if (/^(?:leave (?:the )?salvage behind|resume (?:automatic )?salvage collection)$/i.test(salvageOrder)) {
+    state.eoeCrewSalvageEnabled = /^resume/i.test(salvageOrder);
+    state.atdwCommandNotice = state.eoeCrewSalvageEnabled
+      ? "Crew salvage collection and storage resumed."
+      : "Crew salvage collection and storage paused. Say 'Resume salvage collection' to resume.";
+    return { text };
+  }
   if (command.startsWith("#AUTOSKILL")) {
     if (command==="#AUTOSKILL ON") state.eoeImplicitSkillsEnabled=true;
     if (command==="#AUTOSKILL OFF") state.eoeImplicitSkillsEnabled=false;
@@ -868,14 +934,11 @@ const modifier = (text) => {
   }
 
   // ========================================================================
-  /** SITE ENTRY — strictly command-authorized.
-   * There is no natural-language/AI entry while aboard Node 0. Both a new
-   * arrival and re-entry after boarding obey the same #ENTER gate.
-   */
+  /** SITE ENTRY — requires a direct player action validated by Input. */
   // ========================================================================
   if (site && site.nodes && site.mode === "AT_SHIP" && travel.phase === "exploring") {
     site.entryPending = false;
-    if (command === "#ENTER") enterGraphSite(site, "COMMAND");
+    if (command === "#ENTER") enterGraphSite(site, naturalCommand ? "NATURAL" : "COMMAND");
     else if (command === "#EXITS") {
       state.atdwCommandNotice = "Aboard Node 0 — Eirseid ship. Use #ENTER to cross the docking hatch into Area 1, or #DEPART to begin the return voyage.";
     }
@@ -896,7 +959,7 @@ const modifier = (text) => {
       // One-turn signal for CONTEXT. The menu is authoritative, but the
       // storyteller also needs to know this was observation, not traversal.
       site.exitsLookOnly = true;
-      site.exitsStandalone = /^\s*(?:>\s*(?:You\s+)?)?#EXITS[.!?]*\s*$/i.test(raw);
+      site.exitsStandalone = naturalCommand === "#EXITS" || /^\s*(?:>\s*(?:You\s+)?)?#EXITS[.!?]*\s*$/i.test(raw);
       site.showExits = true;
       log(`NAV LOOK | room=${site.currentAreaId} exits=${getSiteExits(site).length}`);
       return { text };
@@ -917,7 +980,9 @@ const modifier = (text) => {
     if (!intent) {
       // Combat, negotiation and other local actions belong to the narrator.
       log(`NAV STAY | room=${site.currentAreaId} (no movement intent)`);
-      if (!/#\w+/.test(raw) && input.trim()) eoeCreatureDirectorTick(actionId,'ROLEPLAY');
+      if (!/#\w+/.test(raw) && input.trim()) {
+        if (!eoeCreatureExplorationBeat(site, actionId)) eoeCreatureDirectorTick(actionId,'ROLEPLAY');
+      }
       return { text };
     }
     const scores = scoreGraphExitMatches(input, site);
