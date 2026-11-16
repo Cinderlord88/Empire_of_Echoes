@@ -1,8 +1,8 @@
 /**
  * EMPIRE OF ECHOES — OUTPUT
- * Version: 0.10.0-alpha.17
+ * Version: 0.10.0-alpha.23
  * Script: Output
- * Release: CBT-01D6 — Intent Detection & Species Registry
+ * Release: Autonomous Site Encounters
  * Save Schema: 1
  * Health Schema: 1
  */
@@ -54,6 +54,39 @@ const eoeDescribeObservedExits = (site, exits) => {
     return description;
   });
   return `${lead}\n\n${prose.join(" ")}`;
+};
+
+/** Correct explicit relocation onto the expedition vessel during Site play. */
+const eoeSiteShipDrift = (prose, site, room) => {
+  if (!site || !room || site.mode !== "EXPLORING_ACTIVE") return false;
+  const name = state.eoeCurrentShip?.name;
+  const lead = String(prose || "").slice(0, 2400)
+    .replace(/"[^"]*"|“[^”]*”/g, "");
+  if (!name) return false;
+  const occupant = /\b(?:you\s+(?:are|find yourself|stand|sit)|(?:you and )?the crew\s+(?:are|is|stand|stands)|you\s+(?:board|step aboard))\s+(?:now\s+)?(?:back\s+)?(?:(?:aboard|on board|inside)\s+)?(?:the\s+)?$/i;
+  const index = lead.toLowerCase().indexOf(name.toLowerCase());
+  if (index < 0) return false;
+  const continuation = lead.slice(index + name.length);
+  if (/^\s+(?:[^.!?]{0,45}\s+as it\s+)?(?:carries (?:you|the crew)|glides|travels|flies) through space\b/i.test(continuation)) return true;
+  return occupant.test(lead.slice(0,index)) &&
+    !/^\s*(?:in (?:the|a) (?:recording|simulation|dream)|would|if)\b/i.test(lead.slice(index+name.length));
+};
+const eoeIsRoomEntryRetry = (move, count, actions) => {
+  const latest = Array.isArray(actions) ? actions[actions.length - 1] : null;
+  return Number.isFinite(count) && Number.isFinite(move.entryOutputCount) &&
+    Math.abs(count - move.entryOutputCount) <= 2 &&
+    latest?.type === "do" && !!move.entryActionText &&
+    String(latest.text || "").trim() === move.entryActionText;
+};
+
+const eoeSiteSceneFallback = (site, room) => {
+  // Never change any scripted state or generate a new encounter. The fixed
+  // room scene and current encounter facts were already stored in Library.
+  const title=getGraphRoomTitle(room);
+  const identity=`Inside the Site, Area ${room.areaId}${title?` — ${title}`:""}, `;
+  const scene=String(room.roomScene || "This is the same established chamber the crew reached.").trim();
+  const contents=describeRoomContents(room,!!(site.lastMove && site.lastMove.firstVisit));
+  return `${identity}${scene} ${contents}`.trim();
 };
 
 const modifier = (text) => {
@@ -112,6 +145,15 @@ const modifier = (text) => {
     state.eoeSkillSetupNotice = "";
     return {text:notice};
   }
+  const encounterTurn=state.eoeEncounterTurn;
+  if(encounterTurn && currentAction!==null && encounterTurn.actionId===currentAction){
+    state.message='';return {text:encounterTurn.message};
+  }
+  const economyTurn=state.eoeEconomyTurn;
+  if(economyTurn && currentAction!==null && economyTurn.actionId===currentAction){
+    state.message='';
+    return {text:economyTurn.ok?economyTurn.message:`ECONOMY — NO ACTION\n${economyTurn.error}`};
+  }
   const gearTurn=state.eoeGearTurn;
   if (gearTurn && currentAction!==null && gearTurn.actionId===currentAction) {
     state.message='';
@@ -130,7 +172,9 @@ const modifier = (text) => {
     // A non-empty AI response may embellish, but Context sets hard bounds.
     // Fallback handles a blank AI response without inventing an enemy death.
     const ai=String(text||'').trim();
-    const result=ai || (combatTurn.creatureDead
+    const grounded=eoeReconcileNaturalCombatProse(ai,combatTurn);
+    if(grounded!==ai)log(`OUT NCI PROSE | action=${currentAction} conflicting-death-corrected=true`);
+    const result=grounded || (combatTurn.creatureDead
       ? `Your ${combatTurn.weaponName.toLowerCase()} strikes ${combatTurn.targetName}. The creature collapses and dies.`
       : combatTurn.hit
         ? `Your ${combatTurn.weaponName.toLowerCase()} strikes ${combatTurn.targetName}; the wounded creature remains alive.`
@@ -283,6 +327,9 @@ const modifier = (text) => {
     () => { aiMenusRemoved++; return ""; }
   );
   if (aiMenusRemoved) log(`OUT AI EXIT MENU SCRUB | count=${aiMenusRemoved}`);
+  // An AI-generated title can be concatenated directly to its preceding
+  // sentence without a newline ("...chimes.AREA 18 — MEDICAL BAY").
+  text=text.replace(/(?<=[.!?])[ \t]*AREA[ \t]+\d+[ \t]*[—–-][ \t]*(?!EXITS\b)[A-Z][A-Z 0-9-]{2,78}(?=\r?\n|$)/gm,"");
   // Only OUTPUT writes the canonical persistent AREA heading. A storyteller
   // sometimes imitates it, particularly when an automatic menu appears before
   // the room prose. Strip all standalone AI-authored area titles first.
@@ -293,6 +340,26 @@ const modifier = (text) => {
     () => { aiHeadingsRemoved++; return ""; }
   );
   if (aiHeadingsRemoved) log(`OUT AI AREA HEADING SCRUB | count=${aiHeadingsRemoved}`);
+  // NAV-08: an AI ship-arrival scene cannot be made true merely by adding
+  // an AREA heading to it. Fall back to the immutable node's scene only on
+  // an explicit contradiction of the current physical location.
+  const narrativeSite=state.currentSiteId && state.sites ? state.sites[state.currentSiteId] : null;
+  const narrativeRoom=narrativeSite && narrativeSite.mode === "EXPLORING_ACTIVE"
+    ? getSiteNode(narrativeSite,narrativeSite.currentAreaId) : null;
+  const narrativeAction=typeof info !== "undefined" && Number.isFinite(info.actionCount)
+    ? info.actionCount : null;
+  if (eoeSiteShipDrift(text,narrativeSite,narrativeRoom)) {
+    text=eoeSiteSceneFallback(narrativeSite,narrativeRoom);
+    log(`OUT NAV SHIP DRIFT CORRECTED | room=${narrativeRoom.areaId} action=${narrativeAction}`);
+  }
+  if (narrativeRoom) {
+    const clean = eoeStripExpeditionShipScene(text, state.eoeCurrentShip?.name);
+    if (clean !== text) text = clean.trim() || eoeSiteSceneFallback(narrativeSite,narrativeRoom);
+  }
+  const localCreature = narrativeRoom && eoeCombatCreatureAtLocation();
+  if (localCreature?.entry.status === "defeated") {
+    text = eoeRemoveDeadCreatureActions(text, localCreature.creature.creatureName);
+  }
   // A standalone #EXITS must be observational only, but must not delete the
   // player's requested *description* of the routes. The AI might invent a
   // traversal, so replace only this pure-query response with graph-grounded
@@ -358,7 +425,31 @@ const modifier = (text) => {
     site.lastMove && Number(site.lastMove.to) === Number(site.currentAreaId) &&
     typeof info !== "undefined" && Number.isFinite(info.actionCount) &&
     Number.isFinite(site.lastMove.actionCount) &&
-    site.lastMove.actionCount === info.actionCount);
+    (site.lastMove.actionCount === info.actionCount ||
+      eoeIsRoomEntryRetry(site.lastMove, currentAction, typeof history !== "undefined" ? history : [])));
+  if (moveInThisAction && !Number.isFinite(site.lastMove.entryOutputCount)) {
+    const latest = typeof history !== "undefined" && Array.isArray(history) ? history[history.length - 1] : null;
+    if (latest?.type === "do") {
+      site.lastMove.entryOutputCount = currentAction;
+      site.lastMove.entryActionText = String(latest.text || "").trim();
+    }
+  }
+  if (site?.lastMove && (moveInThisAction || (site.lastMove.actionCount === currentAction && currentAction !== null))) {
+    const { crewRecovered, crewStored, crewUnstored } = site.lastMove;
+    if (crewRecovered?.length) text += `\n\nThe crew packs the routine salvage: ${crewRecovered.join("; ")}.`;
+    if (crewStored?.length) text += `\n\nThe crew stows the routine salvage in the cargo hold: ${crewStored.join("; ")}.`;
+    if (crewUnstored?.length) text += `\n\nThe cargo hold has no space for the remaining salvage: ${crewUnstored.join("; ")}. It stays in the pack.`;
+  }
+  // ECO-01: reveal the actual inventory quantities on first entry only.
+  if(moveInThisAction && site.lastMove.firstVisit){
+    const room=getSiteNode(site,site.currentAreaId);
+    if(room && room.eoeLootInitialized===true){
+      const found=eoeEconomyLots().filter(l=>l.siteId===site.siteId && l.areaId===room.areaId && l.room>0);
+      if(found.length)state.message+=(state.message?'\n':'')+
+        `SALVAGE REMAINING: ${found.map(l=>l.name+' x'+l.room).join('; ')}. `+
+        'You can describe taking it or leave it behind. Appraisal values remain unknown.';
+    }
+  }
   const reminderDue = travel && (travel.phase === "traveling" || travel.phase === "event")
     ? atdwTickTurnReminder("travel", ATDW_SETTINGS.TRAVEL_REMINDER_TURNS)
     : false;
@@ -392,6 +483,7 @@ const modifier = (text) => {
         eventDay: 0, event: null, eventTriggered: false, eventResolved: false,
         siteGenerated: false, dayNeedsNarration: false, eventRoleplayActions: 0,
         autoResolutionPendingNarration: false };
+      eoeEconomyDock();
       log(`OUT HOME COMPLETE | from=${state.lastCompletedSiteId || "none"}`);
     } else if (travel.phase === "fatal") {
       state.message = "JOURNEY ENDED — fatal arrival.";
@@ -415,7 +507,8 @@ const modifier = (text) => {
     // On any room arrival, guarantee observable passage descriptions even if
     // the storyteller ignores its explicit CONTEXT instruction. Only add
     // missing landmarks; avoid re-narrating passages already established by AI.
-    if ((moveInThisAction || (site.exitsLookOnly && !pureExitQuery)) && exits.length) {
+    if ((moveInThisAction || (site.exitsLookOnly && !pureExitQuery)) && exits.length &&
+        !(state.atdwSettings && state.atdwSettings.autoExits && moveInThisAction)) {
       const sceneLower = text.toLowerCase();
       const missing = exits.filter(exit =>
         !exit.landmark || !sceneLower.includes(String(exit.landmark).toLowerCase()));
@@ -444,14 +537,10 @@ const modifier = (text) => {
       const exitMenu = `AREA ${site.currentAreaId} — EXITS\n${lines.join("\n")}\n` +
         `Type #EXPLORE<number> to choose a numbered exit, or describe where you go.`;
       if ((site.exitsLookOnly || autoExits) && !site.navWarning) {
-        // Direct, authoritative UI-to-story bridge: every descriptor comes
-        // from the graph, NEVER from the AI. Put automatic menus BEFORE the
-        // narration so any host trailing-output clipping cannot remove exits.
-        // Manual #EXITS retains the familiar story-then-menu order.
-        if (autoExits && !site.exitsLookOnly)
-          text = text ? `${exitMenu}\n\n${text}` : exitMenu;
-        else
-          text = text ? `${text}\n\n${exitMenu}` : exitMenu;
+        // NAV-08: append the single canonical menu AFTER room narration.
+        // Earlier releases prefixed it, forcing the AI to narrate a duplicate
+        // room heading and burying the player's actual route choices.
+        text = text ? `${text}\n\n${exitMenu}` : exitMenu;
         log(`OUT EXITS INLINE | room=${site.currentAreaId} auto=${autoExits} count=${exits.length} options=${exits.map(e => `${e.number}->${e.to}`).join(",")}`);
       } else if (ATDW_SETTINGS.SHOW_ROOM_EXPLORATION_POPUPS || site.navWarning) {
         // Automatic room-entry popups are optional; warnings remain visible
