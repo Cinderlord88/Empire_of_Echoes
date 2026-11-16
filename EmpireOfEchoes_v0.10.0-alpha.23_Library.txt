@@ -1,8 +1,8 @@
 /**
  * EMPIRE OF ECHOES — LIBRARY
- * Version: 0.10.0-alpha.17
+ * Version: 0.10.0-alpha.23
  * Script: Library
- * Release: CBT-01D6 — Intent Detection & Species Registry
+ * Release: Autonomous Site Encounters
  * Save Schema: 1
  * Health Schema: 1
  */
@@ -25,9 +25,9 @@ const ATDW_SETTINGS = {
   // Default false so #AUTOEXITS OFF means no automatic exit list. You may
   // opt into legacy popups here instead of the new inline entry menu.
   SHOW_ROOM_EXPLORATION_POPUPS: false,
-  // OFF means manual #EXITS only. When ON, append
+  // ON by default for new adventures; saved user toggle is preserved. Append
   // authoritative exits to each entry/revisit; never on ordinary Continue.
-  AUTO_EXITS_DEFAULT: false,
+  AUTO_EXITS_DEFAULT: true,
   // SKL-01D: permit high-confidence implicit d20 checks; #AUTOSKILL OFF overrides.
   IMPLICIT_SKILL_CHECKS_DEFAULT: true,
   TRAVEL_REMINDER_TURNS: 10,
@@ -37,13 +37,28 @@ const ATDW_SETTINGS = {
   AZAHEIM_MEDKIT_CAPACITY: 3,
 };
 
+/**
+ * API ADVERTISEMENT — ECO-01 / local JS v1 (implemented)
+ * Transport: direct Library functions shared by this four-tab AI Dungeon script.
+ * External ScriptBridge envelopes/routing: PLANNED; NOT implemented here.
+ * Read capabilities: eoeEconomyStore(), eoeEconomyDisplay(kind),
+ *   eoeEquipmentBenefit(skill,attempt); own state.eoeEconomy schema 1.
+ * Mutation capabilities: eoeEconomyReveal(site,node) on FIRST room entry;
+ *   eoeEconomyExecute(op,target,quantity,actionId,source);
+ *   eoeEconomyDock() on return to Azaheim.
+ * Ops: INVENTORY,CREDITS,SALVAGE,SHOP,COLLECT,STOW,SELL,BUY.
+ * Direct mutation requires a stable action ID; Retry uses a bounded ledger.
+ * No generic cross-script event subscriptions, external HTTP, or callbacks.
+ * Authority: JS owns quantities, location, money, appraisal and equipment.
+ */
+
 // ============================================================================
 // VER-01: unified script release label; independent persistence metadata.
 // This adds metadata to old saves without migrating or resetting game state.
 // The health registry has its OWN schema (EOE_HEALTH_SCHEMA_VERSION), unchanged.
 // ============================================================================
-const EOE_RELEASE_VERSION = "0.10.0-alpha.17";
-const EOE_RELEASE_ID = "CBT-01D6";
+const EOE_RELEASE_VERSION = "0.10.0-alpha.23";
+const EOE_RELEASE_ID = "NAV-08";
 const EOE_SAVE_SCHEMA_VERSION = 1;
 const eoeEnsureReleaseMeta = () => {
   const old = state.eoeReleaseMeta;
@@ -71,8 +86,8 @@ const eoeEnsureReleaseMeta = () => {
 // Knockdown and automatic healing remain deferred. HP-01C2 records
 // descriptive ATDW injury rolls (specific extra effects deferred). HP-01B3
 // projects established Wounds into character cards and narrative cues.
-// Natural Site creatures remain unrated pending their combat integration.
-// CBT-01D2 rates location-scoped debug creatures once, persisted in health v1.
+// Natural Site creatures are rated on first actual encounter, not hidden generation.
+// CBT-01D2 rates debug creatures once; NCI-01 extends this to first-visited Site specimens.
 //
 // IDs are based on party slot and Site/area, NEVER solely on a creature name.
 // Stored records are authoritative; registration only fills ABSENT keys.
@@ -152,7 +167,7 @@ const eoeCombatDifficultyStatus = () => {
   return {ok:true,message:`COMBAT DIFFICULTY — ${state.atdwSettings.combatDifficulty} ${cfg.name}; `+
     `maximum Wounds ${pc.maxWounds}; ${pc.woundsRemaining}/${pc.maxWounds} remaining; `+
     `enemy attack modifier ${cfg.enemyAttack>=0?"+":""}${cfg.enemyAttack}. `+
-    "Debug-creature autonomy is opt-in via #DEBUG CREATURE AUTO ON; natural Site autonomy is not yet integrated."};
+    "Debug autonomy is opt-in. Normal Site creatures react mechanically after provocation, but cannot roam between areas yet."};
 };
 const eoeCombatSetDifficulty = level => {
   const cfg=EOE_COMBAT_DIFFICULTIES[level];
@@ -529,8 +544,11 @@ const eoeHealthTreat = request => {
       (!request.debugAuthorized || !Array.isArray(request.debugRolls) ||
        request.debugRolls.length!==1 || request.debugRolls[0]!==20))
     return error("Invalid debug treatment request; no supplies consumed.");
+  const gear=healer&&healer.kind==='PC'?eoeEquipmentBenefit('Medical Aid','field treatment wounds'):null;
+  const mode=request.debugAuthorized?'normal':gear?gear.mode:'normal';
   const check=eoeResolveCheck({actor:healer,check:"Medical Aid",difficulty:"normal",
-    woundPenalty,...(request.debugAuthorized ? {rolls:request.debugRolls} : {})});
+    woundPenalty,mode,...(request.debugAuthorized ? {rolls:request.debugRolls} : {})});
+  if(check.ok&&mode==='advantage'&&gear)check.equipmentSource=gear.source;
   if (!check.ok) return error(`Medical Aid check unavailable: ${check.error}`);
   const before=patient.woundsRemaining;
   stock.charges--;
@@ -926,8 +944,10 @@ const eoeResolveExplicitSkillCheck = (raw, actionId) => {
   }
   const wound=eoeSkillActorWoundPenalty(actor);
   if (!wound.ok) return {ok:false,actionId,error:wound.error};
+  const gear=actor.kind==='PC'?eoeEquipmentBenefit(parsed.check,parsed.attempt):null;
   const result=eoeResolveCheck({actor,check:parsed.check,difficulty:"normal",
-    woundPenalty:wound.value});
+    woundPenalty:wound.value,mode:gear?gear.mode:'normal'});
+  if(result.ok&&gear)result.equipmentSource=gear.source;
   if (!result.ok) return {ok:false,actionId,error:result.error};
   const narrativePlan=eoeBuildSkillNarrativePlan(result,parsed.attempt,actor.kind);
   // Retain the legacy `seed` property for compatibility with existing saves
@@ -977,7 +997,7 @@ const eoeDetectImplicitSkillCheckRequest = raw => {
   // Avoid rolling for unrelated exposition with a skill word buried inside.
   const actor=/^(?:i\s+|we\s+|my\s+)?(?:try\s+to\s+|attempt\s+to\s+|attempt\s+|carefully\s+|quietly\s+|quickly\s+|use\s+(?:my|a|an|the)\s+(?:[\w-]+\s+){1,4}to\s+)?/i;
   const stripped=t.replace(actor,"");
-  const firstWord=/^(?:repair|restore|jury-rig|reconnect|reboot|operate|unlock|translate|interpret|diagnose|fix|rewire|reroute|recalibrate|calibrate|troubleshoot|splice|solder|hack|override|patch|interface|decode|decipher|reprogram|activate|bypass|analy[sz]e|conduct|determine|synthesize|identify|assay|test|classify|study|perform|stitch|seal|administer|stabilize|diagnose|check|set|treat|bandage|resuscitate|sneak|conceal|creep|hide|slip|evade|move|pickpocket|persuade|threaten|convince|bluff|intimidate|negotiate|bargain|lie|coax|search|inspect|look|spot|detect|examine|scan|locate|track|forage|follow|find|build|navigate|pilot|guide|steer|dock|maneuver|resist|keep|push|pry|force|lift|bend|pick|disarm)\b/i;
+  const firstWord=/^(?:repair|restore|jury-rig|reconnect|reboot|operate|unlock|translate|interpret|diagnose|fix|rewire|reroute|recalibrate|calibrate|troubleshoot|splice|solder|hack|override|patch|interface|decode|decipher|reprogram|activate|bypass|analy[sz]e|conduct|determine|synthesize|identify|assay|test|classify|study|perform|stitch|seal|administer|stabilize|diagnose|check|set|treat|bandage|resuscitate|sneak|conceal|creep|hide|slip|evade|move|pickpocket|persuade|threaten|convince|bluff|intimidate|negotiate|bargain|lie|coax|search|inspect|look|spot|detect|examine|scan|locate|track|forage|follow|find|build|navigate|pilot|guide|steer|dock|maneuver|resist|keep|push|pry|force|lift|bend|pick|disarm|climb|scale|scramble)\b/i;
   if (!firstWord.test(stripped)) return null;
   // No navigating site passages, implied combat, or high-confidence movement
   // command. Do not intercept the graph-navigation subsystem.
@@ -1014,6 +1034,8 @@ const eoeDetectImplicitSkillCheckRequest = raw => {
     /\b(?:psychic|intrusion|mind|composure|terror|panic|mental|fear)\b/i);
   add('STR',/\b(?:pry|force|lift|bend|break)\b/i,
     /\b(?:jammed|sealed|heavy|stuck|hatch|door|crate|grate|bulkhead|gate)\b/i);
+  add('STR',/\b(?:climb|scale|scramble)\b/i,
+    /\b(?:wall|ladder|cliff|shaft|ledge|rock|slope|climbing|rubble)\b/i);
   add('DEX',/\b(?:pick|disarm)\b/i,/\b(?:mechanical lock|spring-loaded trap|trap|lock)\b/i);
   // If multiple skills match, leave it to explicit #skillcheck or ordinary
   // narration, never perform two different checks from a single action.
@@ -1025,8 +1047,10 @@ const eoeResolveImplicitSkillCheck = (raw, actionId, parsed) => {
   if (!parsed || !parsed.ok || !state.eoePlayerProfile || state.eoePlayerProfile.kind!=='PC') return null;
   const wound=eoeSkillActorWoundPenalty(state.eoePlayerProfile);
   if (!wound.ok) return null; // conservative detector: no invented numeric result
+  const gear=eoeEquipmentBenefit(parsed.check,parsed.attempt);
   const result=eoeResolveCheck({actor:state.eoePlayerProfile,check:parsed.check,
-    difficulty:'normal',woundPenalty:wound.value});
+    difficulty:'normal',woundPenalty:wound.value,mode:gear?gear.mode:'normal'});
+  if(result.ok&&gear)result.equipmentSource=gear.source;
   if(!result.ok)return null;
   const narrativePlan=eoeBuildSkillNarrativePlan(result,parsed.attempt,'PC');
   return {ok:true,actionId,actorName:'Player',attempt:parsed.attempt,check:result.check,
@@ -1307,7 +1331,7 @@ const eoeShipCardText = ship => [
   `Exterior: a broad triangular hull, approximately 18 m long and 12 m at its widest. The seamless outer surface has a single aft access aperture and no familiar cockpit windows.`,
   `Interior: a continuous deck, indirect illumination from within smooth walls, three sleeping positions, washroom facilities, stowage and basic external sensing.`,
   `Mobility: hovers above ground without landing gear; uses Eirseid warp travel with occasional recalibration stops. External viewing is provided by the ship's responsive wall displays.`,
-  `Nominal storage: 150 slots, of which 96 are available with ordinary provisions (reference specifications only; no inventory or cargo accounting is implemented).`,
+  `Nominal storage: 150 slots, of which 96 are available with ordinary provisions (Eirseid salvage cargo accounting uses the 96 ordinary free slots).`,
   `Shipboard continuity: the same craft remains at the Site's Node 0, carries the crew back to Azaheim, and must never be replaced by a different ship during this expedition.`,
   `No additional weapons, systems, modifications or cargo are implied by this record.`
 ].join("\n");
@@ -1443,15 +1467,21 @@ const ATDW_COMMAND_CATALOG = [
   ["Debug", "#DEBUG CREATURE SPAWN [BRUTE|LURKER|RANGED|SWARM|PSYCHIC] / STATUS / ATTACK / CLEAR", "Spawn a test creature with difficulty-weighted Wounds; #DEBUG CREATURE STATUS shows remaining health. #DEBUG CREATURE AUTO ON enables motive-led test actions, including real injury, and OFF disables them."],
   ["Debug", "#DEBUG CREATURE AUTO ON / OFF / STATUS", "Opt into a creature-directed test encounter: drive and class guide warning, stalking, approach, withdrawal and occasional real attacks. OFF by default; real Wounds/death possible when ON. Hash commands never advance this pilot."],
   ["Debug", "#DEBUG RANGE STATUS / AT_RANGE / ENGAGED", "Inspect or explicitly set two-state engagement of the current test creature. At range melee creatures cannot strike; engaged melee gains +2, ranged attacks take -2; debug placement costs no time."],
-  ["Combat", "#GEAR / #EQUIP PISTOL / #EQUIP KNIFE", "Show basic starting weapons or equip one you actually own; rifle and sword are recognized but not granted. Normal-language attacks use weapon+verb when a debug creature is present."],
-  ["Combat", "Flee / Hide (normal language)", "When facing a local test creature, flee or hide behind cover via natural language. JavaScript resolves DEX or Stealth; first attack from HIDDEN gets +2 then reveals the player."],
+  ["Economy", "#INVENTORY / #SALVAGE / #CREDITS", "Show owned gear, room salvage, ship cargo and credits. Normal language also works."],
+  ["Economy", "#SHOP / #BUY <item> [qty]", "At Azaheim, browse the fixed catalog and buy equipment; rare stock is checked once per return."],
+  ["Economy", "#COLLECT <item|ALL> / #STOW <item|ALL>", "Take real salvage from the current room; deposit it aboard the ship at Node 0."],
+  ["Economy", "#SELL <item|ALL>", "At Azaheim, sell recovered salvage for appraised credits divided among surviving crew."],
+  ["Combat", "#GEAR / #EQUIP PISTOL / #EQUIP KNIFE / #EQUIP RIFLE", "Check your actual weapons; Ranged Combat specialists receive one starting rifle. Describe combat naturally."],
+  ["Combat", "#ENCOUNTER", "Read-only status for the current natural Site creature, if it has been introduced. Does not create or reveal encounters."],
+  ["Combat", "Flee / Hide (normal language)", "Facing a local creature, flee or hide behind cover via natural language. JavaScript resolves DEX or Stealth; first attack from HIDDEN gets +2 then reveals the player."],
   ["Settings", "#COMBAT DIFFICULTY [1-5]", "View or change difficulty. Levels: 1 Easy (5 PC Wounds, -4 enemy attack), 2 Lightweight (4, -2), 3 Average (3, 0), 4 Hard (3, +1), 5 Brutal (3, +2). Newly spawned debug creatures also roll one-time weighted Wound capacities; existing creatures never reroll."],
   ["Help", "#COMMANDS", "Display the current commands directly, even when another triggerless Story Card prevents automatic reference-card creation."]
 ];
 const ATDW_DOC_TYPE = "ATDW_GAME_COMMANDS";
 const atdwCommandCardText = () =>
   `GAME COMMANDS — PLAYER QUICK REFERENCE\n` +
-  `This card is for YOU, the player. It has NO triggers and is not a storytelling instruction.\n\n` +
+  `This card is for YOU, the player. It has NO triggers and is not a storytelling instruction.\n` +
+  `You can play entirely through natural-language actions; commands are optional information/fallback tools.\n\n` +
   ATDW_COMMAND_CATALOG.map(row => `${row[0]} | ${row[1]} — ${row[2]}`).join("\n") +
   `\n\nHash commands work anywhere in player-authored Do, Say or Story text, including after dialogue (for example: "Strap in!" #LIFTOFF). ` +
   `They execute even when spoken as part of a conversation, so type them only when you intend to execute them. ` +
@@ -2268,7 +2298,7 @@ Do not reveal this procedural creature record or the random generation process t
 
 };
 
-// CBT-01D6: A creature's generated word names its SPECIES, not its individual.
+// ECO-01: A creature's generated word names its SPECIES, not its individual.
 // One canonical phenotype is kept in persistent state; specimens retain unique
 // health/encounter IDs and can differ in wounds, posture, and location.
 const EOE_SPECIES_CARD_TYPE = "EOE_CREATURE_SPECIES";
@@ -3145,6 +3175,338 @@ const artifactValue = [
   { category: "Priceless", value: 100 }
 ];
 
+// ============================================================================
+// ECO-01 — SALVAGE, CREDITS, MARKETPLACE (alpha.18)
+// One authoritative ledger: discovery is not ownership, ownership is not sale.
+// Save schema 1 is unchanged; this module uses its own additive schema 1.
+// ECONOMY API advertisement (available): eoeEconomyStore(),
+// eoeEconomyReveal(site,node), eoeEconomyAction(operation,target,quantity,id),
+// eoeEquipmentBenefit(check,attempt), eoeEconomyDetectNatural(raw).
+// This version does not simulate suit Armor, oxygen use, ammo consumption,
+// continuous environmental physics, or natural Site creature combat.
+// ============================================================================
+const EOE_ECONOMY_SCHEMA=1;
+const EOE_MARKET=Object.freeze({
+  oxygen_pellet:{name:'Oxygen Pellet',aliases:['oxygen pellets','oxygen pellet'],price:5,slots:0.1,kind:'consumable',stock:'basic'},
+  battery:{name:'Battery',aliases:['batteries','battery'],price:5,slots:0.1,kind:'consumable',stock:'basic'},
+  ammo:{name:'Ammunition Clip',aliases:['ammunition clips','ammunition clip','ammo clip','ammo'],price:5,slots:0.1,kind:'consumable',stock:'basic'},
+  suit_sealant:{name:'Emergency Suit Sealant',aliases:['emergency suit sealant','suit sealant','sealant'],price:20,slots:0.1,kind:'consumable',stock:'basic'},
+  medkit:{name:'Medical Kit',aliases:['medical kits','medical kit','medkits','medkit'],price:100,slots:1,kind:'medical',stock:'basic'},
+  scanner:{name:'Survey Scanner',aliases:['survey scanners','survey scanner'],price:100,slots:1,kind:'exploration',stock:'basic'},
+  atmosphere_sensor:{name:'Atmospheric Sensor',aliases:['atmospheric sensors','atmospheric sensor','air sensor'],price:100,slots:0.1,kind:'exploration',stock:'basic'},
+  magnetic_boots:{name:'Magnetic Boots',aliases:['magnetic boots'],price:100,slots:1,kind:'exploration',stock:'basic'},
+  toolkit:{name:'Tool Kit',aliases:['tool kits','tool kit','toolkit','toolkits'],price:200,slots:1,kind:'exploration',stock:'basic'},
+  survival_kit:{name:'Survival Kit',aliases:['survival kits','survival kit'],price:200,slots:1,kind:'exploration',stock:'basic'},
+  climbing_kit:{name:'Climbing Kit',aliases:['climbing kits','climbing kit'],price:200,slots:2,kind:'exploration',stock:'basic'},
+  vision:{name:'Night Vision Lenses',aliases:['night vision lenses','night vision'],price:800,slots:0.1,kind:'exploration',stock:'basic'},
+  medical_scanner:{name:'Medical Scanner',aliases:['medical scanners','medical scanner'],price:1000,slots:1,kind:'medical',stock:'rare'}
+});
+const eoeEconomyStore=()=>{
+  if(state.eoeEconomy===undefined){
+    // ATDW starting funds: d20 x 100; seeded once per existing or new save.
+    state.eoeEconomy={schemaVersion:EOE_ECONOMY_SCHEMA,credits:(1+Math.floor(Math.random()*20))*100,
+      lots:{},gear:{},transactions:{},transactionOrder:[],lastActionId:null,
+      rareChecks:{},lastDockedSiteId:null};
+    log(`ECO INITIAL | credits=${state.eoeEconomy.credits} once per save`);
+  }
+  const s=state.eoeEconomy;
+  if(!s||s.schemaVersion!==EOE_ECONOMY_SCHEMA||!Number.isSafeInteger(s.credits)||s.credits<0||
+     !s.lots||typeof s.lots!=='object'||Array.isArray(s.lots)||
+     !s.gear||typeof s.gear!=='object'||Array.isArray(s.gear)||
+     !s.transactions||typeof s.transactions!=='object'||Array.isArray(s.transactions)||
+     !Array.isArray(s.transactionOrder)||!s.rareChecks||typeof s.rareChecks!=='object'){
+    log('ECO STORE | corrupt or unsupported schema; no changes');return null;
+  }
+  return s;
+};
+const eoeEconomySite=()=>state.currentSiteId&&state.sites?state.sites[state.currentSiteId]:null;
+const eoeEconomyHome=()=>!!state.travel&&state.travel.phase==='idle'&&!state.currentSiteId;
+const eoeEconomyLot=({id,name,kind,qty,value,slots,siteId,areaId})=>({
+  id,name,kind,total:qty,value,slots,siteId,areaId,
+  room:qty,carried:0,ship:0,station:0,sold:0
+});
+// Called only on a first visit; never create new salvage in old visited rooms.
+const eoeEconomyReveal=(site,node)=>{
+  const s=eoeEconomyStore();if(!s||!site||!node||node.areaId===0)return false;
+  if(node.eoeLootInitialized===true)return true;
+  if(node.eoeLootInitialized!==undefined)return false;
+  if(node.result!=='Resources'&&node.result!=='Xenoanthropological Artifact'){
+    node.eoeLootInitialized=true;node.eoeLootIds=[];return true;
+  }
+  const prefix=`${String(site.siteId)}:${String(node.areaId)}`;
+  const pending=[];
+  if(node.result==='Resources'){
+    pending.push(eoeEconomyLot({id:`${prefix}:crystals`,name:'Eirseid Data Crystal',kind:'crystal',qty:1+Math.floor(Math.random()*10),value:50,slots:.1,siteId:site.siteId,areaId:node.areaId}));
+    pending.push(eoeEconomyLot({id:`${prefix}:alloy`,name:'Eirseid Alloy Cube',kind:'alloy',qty:1+Math.floor(Math.random()*6),value:75,slots:1,siteId:site.siteId,areaId:node.areaId}));
+  }else{
+    const a=node.xenoanthropologicalArtifact||node.artifact;
+    if(a&&typeof a.description==='string'&&Number.isSafeInteger(a.value)&&a.value>=0){
+      pending.push(eoeEconomyLot({id:`${prefix}:artifact`,name:a.description,kind:'artifact',qty:1,value:a.value,
+        slots:a.weight==='Light'?.1:1,siteId:site.siteId,areaId:node.areaId}));
+      for(const record of [node.xenoanthropologicalArtifact,node.artifact])
+        if(record&&record.status==='Undiscovered')record.status='Discovered';
+    }
+  }
+  // Existing ledger ID means a prior roll's contents win; do not mint again.
+  for(const p of pending)if(!Object.prototype.hasOwnProperty.call(s.lots,p.id))s.lots[p.id]=p;
+  node.eoeLootIds=pending.map(p=>p.id);node.eoeLootInitialized=true;
+  if(pending.length)log(`ECO REVEAL | site=${site.siteId} area=${node.areaId} loot=${pending.map(x=>`${x.kind}:${x.total}`).join(',')}`);
+  return true;
+};
+const eoeEconomyLots=()=>{
+  const s=eoeEconomyStore();return s?Object.values(s.lots).filter(l=>l&&typeof l==='object'&&Number.isSafeInteger(l.total)&&l.total>=0):[];
+};
+const eoeEconomyPackUsed=()=>{
+  const s=eoeEconomyStore();if(!s)return Infinity;
+  const lots=eoeEconomyLots();let light=0,slots=0;
+  for(const l of lots){if(l.slots===.1)light+=l.carried||0;else slots+=(l.carried||0)*l.slots;}
+  for(const id of Object.keys(s.gear)){
+    const n=s.gear[id],spec=EOE_MARKET[id];if(!spec||!Number.isSafeInteger(n)||n<0)return Infinity;
+    if(spec.slots===.1)light+=n;else slots+=n*spec.slots;
+  }
+  return slots+Math.ceil(Math.max(0,light-10)/10);
+};
+const eoeEconomyCarryFits=(lot,qty)=>{
+  if(!lot||qty<1)return false;
+  const s=eoeEconomyStore();if(!s)return false;
+  const current=eoeEconomyPackUsed();
+  if(lot.slots===.1){
+    let lights=0,whole=0;
+    for(const l of eoeEconomyLots())if(l.slots===.1)lights+=l.carried||0;
+    for(const id of Object.keys(s.gear))if(EOE_MARKET[id]&&EOE_MARKET[id].slots===.1)lights+=s.gear[id];
+    for(const l of eoeEconomyLots())if(l.slots!==.1)whole+=(l.carried||0)*l.slots;
+    for(const id of Object.keys(s.gear))if(EOE_MARKET[id]&&EOE_MARKET[id].slots!==.1)whole+=s.gear[id]*EOE_MARKET[id].slots;
+    return whole+Math.ceil(Math.max(0,lights+qty-10)/10)<=15;
+  }
+  return current+lot.slots*qty<=15;
+};
+const eoeEconomyShipUsed=()=>eoeEconomyLots().reduce((n,l)=>n+(l.ship||0)*l.slots,0);
+// Wholly descriptive artifact values remain unknown until an actual sale.
+const eoeEconomyDisplay=(kind='inventory')=>{
+  const s=eoeEconomyStore();if(!s)return 'ECONOMY — State unavailable; no action executed.';
+  const site=eoeEconomySite(),node=site&&site.nodes&&site.nodes[site.currentAreaId];
+  const nearby=node?eoeEconomyLots().filter(l=>l.siteId===site.siteId&&l.areaId===node.areaId&&l.room>0):[];
+  const fmt=(l,q)=>`${l.name} x${q}${l.kind==='artifact'?' (appraisal unknown)':''}`;
+  if(kind==='shop')return `AZAHEIM MARKET — Balance: ${s.credits} credits.\n`+
+    Object.entries(EOE_MARKET).map(([id,x])=>`${x.name}: ${x.price} credits (${x.stock}${x.kind==='consumable'?' — usage tracking pending':''})`).join('; ')+
+    '\nUse #BUY <item> [quantity] or say "I buy a tool kit." Rare stock requires one check per return. Armor and weapon upgrades are not yet sold.';
+  if(kind==='salvage'){
+    return `SALVAGE — Nearby: ${nearby.map(l=>fmt(l,l.room)).join('; ')||'none'}. `+
+      `Carried: ${eoeEconomyLots().filter(l=>l.carried>0).map(l=>fmt(l,l.carried)).join('; ')||'none'}. `+
+      `Ship: ${eoeEconomyLots().filter(l=>l.ship>0).map(l=>fmt(l,l.ship)).join('; ')||'none'}. `+
+      `Station: ${eoeEconomyLots().filter(l=>l.station>0).map(l=>fmt(l,l.station)).join('; ')||'none'}. `+
+      `Cargo: ${eoeEconomyShipUsed().toFixed(1)}/96 GS. Collect in rooms, stow at Node 0, sell at Azaheim.`;
+  }
+  return `INVENTORY — ${s.credits} credits; backpack ${eoeEconomyPackUsed()}/15 GS. `+
+    `Equipment: ${Object.keys(s.gear).filter(id=>s.gear[id]>0).map(id=>`${EOE_MARKET[id].name} x${s.gear[id]}`).join('; ')||'standard issue only'}. `+
+    `Salvage carried: ${eoeEconomyLots().filter(l=>l.carried>0).map(l=>fmt(l,l.carried)).join('; ')||'none'}. `+
+    eoeWeaponInventoryDisplay();
+};
+const eoeEconomyMatch=(target,candidates)=>{
+  const s=String(target||'').toLowerCase().trim().replace(/[.!?]+$/,'');
+  if(!s)return [];
+  const norm=x=>x.toLowerCase().replace(/[^a-z0-9 ]/g,' ').replace(/\s+/g,' ').trim();
+  const n=norm(s);
+  return candidates.filter(x=>{
+    const aliases=[...(x.aliases||[]),...(x.kind==='crystal'?['crystal','crystals','data crystal','data crystals','eirseid data crystals']:[]),...(x.kind==='alloy'?['alloy','cube','cubes','alloy cube','alloy cubes','eirseid alloy cubes']:[]),...(x.kind==='artifact'?['artifact','alien artifact','eirseid artifact','the artifact']:[])];
+    return [x.name,...aliases,x.kind].filter(Boolean).some(k=>{
+      const key=norm(k);return n===key||n===`the ${key}`||n===`eirseid ${key}`||n===key+'s';
+    });
+  });
+};
+const eoeMoveSalvageLots = (lots, from, to, quantity) => {
+  const moved = [];
+  for (const lot of lots) {
+    let count = Math.min(lot[from], quantity === null ? lot[from] : quantity);
+    if (to === "carried") {
+      while (count > 0 && !eoeEconomyCarryFits(lot, count)) count--;
+    } else {
+      const free = Math.max(0, 96 - eoeEconomyShipUsed());
+      count = Math.min(count, Math.floor((free + 1e-7) / lot.slots));
+    }
+    if (count > 0) {
+      lot[from] -= count;
+      lot[to] += count;
+      moved.push(`${lot.name} x${count}`);
+    }
+  }
+  return moved;
+};
+const eoeRoutineSalvage = lot =>
+  (lot.kind === "crystal" && lot.slots === .1) ||
+  (lot.kind === "alloy" && lot.slots === 1);
+const eoeCrewRecoverSalvage = (site, room) => {
+  if (state.eoeCrewSalvageEnabled === false || site.mode !== "EXPLORING_ACTIVE" ||
+      site.currentAreaId !== room.areaId || room.result !== "Resources" ||
+      room.eoeLootInitialized !== true || room.hazardManifestation ||
+      room.encounterCreature || room.eoeMechanicalTrap?.status === "pending" ||
+      eoeCombatCreatureAtLocation()?.entry.status === "present" ||
+      eoeDebugTrapAtLocation()?.trap.status === "pending") return [];
+  const lots = eoeEconomyLots().filter(lot => eoeRoutineSalvage(lot) &&
+    lot.siteId === site.siteId && lot.areaId === room.areaId && lot.room > 0);
+  return eoeMoveSalvageLots(lots, "room", "carried", null);
+};
+const eoeCrewStowSalvage = () => {
+  const site = eoeEconomySite();
+  if (state.eoeCrewSalvageEnabled === false || site?.mode !== "AT_SHIP" ||
+      site.currentAreaId !== 0) return [];
+  const lots = eoeEconomyLots().filter(lot => eoeRoutineSalvage(lot) && lot.carried > 0);
+  return eoeMoveSalvageLots(lots, "carried", "ship", null);
+};
+
+const eoeEconomyAction=(op,target='',quantity=null)=>{
+  const s=eoeEconomyStore();if(!s)return {ok:false,error:'Economy state invalid; no changes.'};
+  const bad=error=>({ok:false,error});
+  const site=eoeEconomySite(),node=site&&site.nodes&&site.nodes[site.currentAreaId];
+  const atRoom=!!site&&site.mode==='EXPLORING_ACTIVE'&&!!node&&node.areaId!==0;
+  const atShip=!!site&&site.mode==='AT_SHIP'&&Number(site.currentAreaId)===0;
+  const home=eoeEconomyHome();
+  if(op==='INVENTORY'||op==='CREDITS'||op==='SALVAGE'||op==='SHOP'){
+    if(op==='SHOP'&&!home)return bad('The Azaheim market is available only between expeditions.');
+    return {ok:true,message:eoeEconomyDisplay(op==='SHOP'?'shop':op==='SALVAGE'?'salvage':'inventory')};
+  }
+  if(op==='COLLECT'){
+    if(!atRoom)return bad('Collect Site salvage only while physically in an exploration room.');
+    const all=/^(all|everything|salvage|loot|all salvage|the salvage|the loot)$/i.test(String(target).trim());
+    const available=eoeEconomyLots().filter(l=>l.siteId===site.siteId&&l.areaId===node.areaId&&l.room>0);
+    const match=all?available:eoeEconomyMatch(target,available);
+    if(!match.length)return bad('No matching uncollected Eirseid salvage exists in this room.');
+    if(!all&&match.length!==1)return bad('Ambiguous salvage; name one item or choose all.');
+    if(quantity!==null&&(!Number.isSafeInteger(quantity)||quantity<1||quantity>100))return bad('Quantity must be 1–100.');
+    const names = eoeMoveSalvageLots(match, "room", "carried", quantity);
+    if(!names.length)return bad('Backpack full. Leave salvage, make room, or return to the ship to stow it.');
+    return {ok:true,message:`SALVAGE COLLECTED — ${names.join('; ')}. Backpack ${eoeEconomyPackUsed()}/15 GS. No credits awarded until return and sale.`};
+  }
+  if(op==='STOW'){
+    if(!atShip)return bad('Stowing salvage requires being aboard the expedition ship at Site Node 0.');
+    const available=eoeEconomyLots().filter(l=>l.carried>0);
+    const all=/^(all|everything|salvage|loot|all salvage|the salvage|the loot)$/i.test(String(target).trim());
+    const match=all?available:eoeEconomyMatch(target,available);
+    if(!match.length)return bad('No matching salvage in the player backpack.');
+    if(!all&&match.length!==1)return bad('Ambiguous item.');
+    const names = eoeMoveSalvageLots(match, "carried", "ship", quantity);
+    if(!names.length)return bad('No cargo capacity or matching carried salvage.');
+    return {ok:true,message:`SHIP CARGO STORED — ${names.join('; ')}. Ship ${eoeEconomyShipUsed().toFixed(1)}/96 GS.`};
+  }
+  if(op==='SELL'){
+    if(!home)return bad('Cosmos accepts salvage only after the crew returns to Azaheim.');
+    const available=eoeEconomyLots().filter(l=>l.carried+l.ship+l.station>0);
+    const all=/^(all|everything|salvage|loot|all salvage|the salvage|the loot)$/i.test(String(target).trim());
+    const match=all?available:eoeEconomyMatch(target,available);
+    if(!match.length)return bad('No recovered salvage matching that description.');
+    if(!all&&match.length!==1)return bad('Ambiguous salvage; name one item or sell all.');
+    const n=quantity===null?Infinity:quantity;
+    if(quantity!==null&&(!Number.isSafeInteger(quantity)||quantity<1||quantity>100))return bad('Quantity must be 1–100.');
+    let gross=0;const names=[];
+    for(const lot of match){
+      let left=Math.min(n,lot.carried+lot.ship+lot.station),count=left;
+      for(const field of ['station','ship','carried']){const delta=Math.min(left,lot[field]);lot[field]-=delta;left-=delta;}
+      if(count>0){lot.sold+=count;gross+=count*lot.value;names.push(`${lot.name} x${count}`);}
+    }
+    // Three-person expeditions normally divide earnings among three survivors.
+    // Use real authoritative crew mortality; don't invent NPC death or shares.
+    const live=[2,3].filter(slot=>{const h=eoeHealthRecord(`crew:${slot}`);return !h||h.status!=='dead';}).length;
+    const shares=1+live,player=Math.floor(gross/shares),remainder=gross%shares;
+    s.credits+=player;
+    return {ok:true,message:`COSMOS APPRAISAL — ${names.join('; ')}. Gross: ${gross} credits. `+
+      `Surviving shares: ${shares}; your share: ${player} credits; ${remainder} remainder retained in expedition settlement. `+
+      `Balance: ${s.credits} credits. Sold items permanently removed from cargo.`};
+  }
+  if(op==='BUY'){
+    if(!home)return bad('Purchases require being at Azaheim between expeditions.');
+    const options=Object.entries(EOE_MARKET).map(([id,x])=>({id,...x}));
+    const match=eoeEconomyMatch(target,options);
+    if(match.length!==1)return bad('Select one catalog item. Use #SHOP for exact names.');
+    const item=match[0],n=quantity===null?1:quantity;
+    if(!Number.isSafeInteger(n)||n<1||n>20)return bad('Purchase quantity must be 1–20.');
+    const cost=item.price*n;
+    if(s.credits<cost)return bad(`Insufficient credits: ${cost} required, ${s.credits} available.`);
+    const next={id:'purchase',slots:item.slots};
+    if(!eoeEconomyCarryFits(next,n))return bad('Backpack capacity insufficient for this purchase.');
+    if(item.stock==='rare'){
+      const key=String(state.lastCompletedSiteId||'initial')+':'+item.id;
+      if(s.rareChecks[key]===undefined)s.rareChecks[key]=1+Math.floor(Math.random()*20);
+      if(s.rareChecks[key]<15)return bad(`${item.name} unavailable this docking visit (stock d20=${s.rareChecks[key]}; need 15+). No money spent.`);
+    }
+    if(item.id==='medkit'){
+      const medical=eoeMedicalStore();
+      if(!medical||medical.charges+5*n>1000)return bad('Medical supply ledger cannot accept five new dressings.');
+      medical.charges+=5*n;
+    }
+    s.credits-=cost;s.gear[item.id]=(s.gear[item.id]||0)+n;
+    return {ok:true,message:`PURCHASED — ${item.name} x${n} for ${cost} credits. Remaining: ${s.credits}. `+
+      (item.id==='medkit'?`Medical supplies now ${eoeMedicalStore().charges} dressings. `:'')+
+      `Equipment recorded. Some equipment effects require appropriate actions and skill checks.`};
+  }
+  return bad('Unsupported economy action.');
+};
+// Check the first applicable carried equipment; never stack bonuses.
+const eoeEquipmentBenefit=(check,attempt)=>{
+  const s=eoeEconomyStore();if(!s)return null;
+  const t=String(attempt||'').toLowerCase();
+  const has=id=>s.gear[id]>0;
+  if(has('climbing_kit')&&['STR','DEX'].includes(check)&&/\b(?:climb|climbing|scale|scaling|scramble|ascending|ascend)\b/.test(t))return {mode:'advantage',source:'Climbing Kit'};
+  if(has('toolkit')&&check==='Technology'&&/\b(?:repair|fix|rewire|calibrate|solder|machinery|mechanical|circuit|wiring)\b/.test(t)&&!/\b(?:eirseid|alien|àrsaidh|arsaidh)\b/.test(t))return {mode:'advantage',source:'Tool Kit'};
+  if(has('medical_scanner')&&check==='Medical Aid')return {mode:'advantage',source:'Medical Scanner'};
+  if(has('medkit')&&check==='Medical Aid'&&/\b(?:treat|treatment|dress|bandage|stabilize)\b/.test(t))return {mode:'advantage',source:'Medical Kit'};
+  if(has('magnetic_boots')&&['STR','DEX'].includes(check)&&/\b(?:zero[- ]g(?:ravity)?|microgravity|weightless(?:ness)?)\b/.test(t))return {mode:'advantage',source:'Magnetic Boots'};
+  if(has('survival_kit')&&check==='Survival'&&/\b(?:forage|shelter|camp|survive|wilderness|water)\b/.test(t))return {mode:'advantage',source:'Survival Kit'};
+  if(has('scanner')&&check==='Perception'&&/\b(?:scan|scanner|survey|anomaly|signal)\b/.test(t))return {mode:'advantage',source:'Survey Scanner'};
+  if(has('atmosphere_sensor')&&check==='Science'&&/\b(?:atmosphere|air|gas|oxygen|toxins?|pressure)\b/.test(t))return {mode:'advantage',source:'Atmospheric Sensor'};
+  if(has('vision')&&check==='Perception'&&/\b(?:dark|darkness|dim|unlit|low.light)\b/.test(t))return {mode:'advantage',source:'Night Vision Lenses'};
+  return null;
+};
+const eoeEconomyDetectNatural=raw=>{
+  const t=String(raw||'').trim().replace(/^>\s*(?:You\s+)?/i,'').trim().replace(/^i(?:'ll| will)\s+/i,'I ');
+  if(!t||t.length>230||/[?#\n]/.test(t)||/^['"“‘]/.test(t)||
+    /\b(?:maybe|perhaps|might|would|should|could|consider|thinking|plan to|want to|hope to|if i|don't|do not|never|refuse|tell|ask|order|instruct|instead of|rather than)\b/i.test(t))return null;
+  const patterns=[
+    ['SHOP',/^(?:i\s+)?(?:browse|look through|check out|visit|inspect)\s+(?:the\s+)?(?:market|marketplace|shop|vendors?|stores?)[.!]*$/i],
+    ['INVENTORY',/^(?:i\s+)?(?:check|inspect|review|look at)\s+(?:my\s+)?(?:inventory|backpack|gear)[.!]*$/i],
+    ['SALVAGE',/^(?:i\s+)?(?:check|inspect|review|look at)\s+(?:our\s+|the\s+)?(?:salvage|loot|cargo)[.!]*$/i],
+    ['COLLECT',/^(?:i\s+)?(?:take|collect|gather|pick up|grab|retrieve)\s+(.+?)[.!]*$/i],
+    ['STOW',/^(?:i\s+)?(?:stow|store|load|deposit|put)\s+(.+?)\s+(?:in|into|aboard|on)\s+(?:the\s+|our\s+)?(?:ship|cargo hold|hold)[.!]*$/i],
+    ['SELL',/^(?:i\s+)?(?:sell|turn in|cash in)\s+(.+?)(?:\s+to\s+(?:cosmos|the\s+buyer|a\s+merchant))?[.!]*$/i],
+    ['BUY',/^(?:i\s+)?(?:buy|purchase)\s+(.+?)[.!]*$/i]
+  ];
+  for(const [op,re] of patterns){const m=t.match(re);if(m){
+    let name=(m[1]||'').replace(/^(?:our|my|the|some|a|an)\s+/i,'').replace(/^all\s+(?:our|the)\s+/i,'all ').trim();let quantity=null;
+    if(op==='COLLECT')name=name.replace(/\s+and\s+(?:put|place|pack|store)\s+(?:it|them)\s+(?:in|into)\s+(?:my|the)\s+(?:pack|backpack|bag)\s*$/i,'').trim();
+    const num=name.match(/^(\d+)\s+(.+)$/);if(num){quantity=Number(num[1]);name=num[2];}
+    const word=name.match(/^(one|two|three|four|five)\s+(.+)$/i);
+    if(word){quantity={one:1,two:2,three:3,four:4,five:5}[word[1].toLowerCase()];name=word[2];}
+    return {op,target:name||'',quantity};
+  }}return null;
+};
+// Shared retry-safe transaction path for explicit and natural actions.
+const eoeEconomyExecute=(op,target,quantity,actionId,source)=>{
+  const s=eoeEconomyStore();if(!s)return {ok:false,error:'Economy ledger unavailable',actionId};
+  if(!Number.isSafeInteger(actionId))return {ok:false,error:'Stable action ID required',actionId};
+  const key=String(actionId);
+  if(Object.prototype.hasOwnProperty.call(s.transactions,key))return {...s.transactions[key],actionId,source};
+  if(s.lastActionId!==null&&actionId<s.lastActionId)return {ok:false,error:'Stale action ID; transaction rejected',actionId};
+  const result=eoeEconomyAction(op,target,quantity);
+  s.transactions[key]={...result,op,target,quantity};s.transactionOrder.push(key);
+  s.lastActionId=actionId;
+  while(s.transactionOrder.length>96)delete s.transactions[s.transactionOrder.shift()];
+  log(`ECO ${op} | action=${actionId} result=${result.ok?'OK':'BLOCK'} target=${String(target).slice(0,70)}`);
+  return {...result,op,target,quantity,source,actionId};
+};
+// Return-docking transfer takes place automatically once, without crediting.
+const eoeEconomyDock=()=>{
+  const s=eoeEconomyStore();if(!s||!eoeEconomyHome())return false;
+  const docking=String(state.lastCompletedSiteId||'initial');
+  if(s.lastDockedSiteId===docking)return true;
+  for(const lot of eoeEconomyLots()){
+    // An arriving player's carried salvage is still carried; ship cargo is
+    // unloaded into station custody to survive vessel replacement.
+    if(lot.ship>0){lot.station+=lot.ship;lot.ship=0;}
+  }
+  s.lastDockedSiteId=docking;
+  log(`ECO DOCK | visit=${docking} cargo transferred for appraisal`);
+  return true;
+};
+
 // ============================================================
 
 /**
@@ -3678,14 +4040,32 @@ const describeRoomContents = (node, isFirstVisit) => {
     const creatureClass = String(c.creatureClass || "creature").toLowerCase();
     const article = /^[aeiou]/.test(appearance) ? "an" : "a";
     const drive = String(c.creatureDrive || "its own motives").replace(/\s+/g, " ").trim();
+    const entry=node.eoeCombat;
+    const h=entry&&entry.source==='natural'&&entry.healthId===`creature:${state.currentSiteId}:${node.areaId}`
+      ? eoeHealthRecord(entry.healthId):null;
+    if(entry&&h&&eoeHealthValidWoundRecord(h)) {
+      if ((entry.areaId ?? node.areaId) !== node.areaId) return 'The creature previously encountered here has left this chamber.';
+      if(h.status==='dead') return `The ${c.creatureName.toLowerCase()} previously encountered here is DEAD (0/${h.maxWounds} Wounds). Its remains may persist; do not narrate it moving, attacking, recovering, or reappearing.`;
+      return `${past?'The same':'Within this space is a'} ${c.creatureName.toLowerCase()}, ${article} ${appearance} ${creatureClass}. ${physical} `+
+        `It is ${h.status} with ${h.woundsRemaining}/${h.maxWounds} Wounds, at ${eoeCreatureEngagement(entry)}; `+
+        `player evasion ${entry.eoeEvasion?entry.eoeEvasion.phase:'EXPOSED'}. Its behavior is driven by ${drive}. `+
+        `It has not moved to another room.`;
+    }
     return past
       ? `The crew previously encountered a ${c.creatureName.toLowerCase()} here. ${physical} Its present fate follows the story already told; do not reintroduce it or restore it if defeated.`
       : `Within this space is a ${c.creatureName.toLowerCase()}, ${article} ${appearance} ${creatureClass}. ${physical} It exhibits ${c.creatureTrait || "unusual traits"} and ${c.creatureAbility || "unusual abilities"}; its behavior is driven by ${drive}.`;
   }
   if (node.result === "Xenoanthropological Artifact" && artifact) {
+    const owned=eoeEconomyLots().find(l=>l.kind==='artifact' && l.id.endsWith(`:${node.areaId}:artifact`) && l.siteId===state.currentSiteId);
+    if(owned && owned.room===0)return `The crew previously discovered ${artifact.description} here, but it has already been removed; no additional artifact remains.`;
     return past
-      ? `During the first survey, the crew discovered ${artifact.description} here. Its current whereabouts depend on what the party subsequently did.`
-      : `Among the debris lies ${artifact.description}, an unfamiliar cultural object whose purpose and value are not yet understood.`;
+      ? `The previously discovered artifact remains here: ${artifact.description}. It can be collected once, not generated again.`
+      : `Among the debris lies ${artifact.description}, an unfamiliar cultural object whose purpose and value are not yet understood. The player may choose whether to collect it.`;
+  }
+  if (node.result === 'Resources' && node.eoeLootInitialized === true) {
+    const lots=eoeEconomyLots().filter(l=>l.siteId===state.currentSiteId&&l.areaId===node.areaId&&l.room>0);
+    return lots.length ? `Recoverable Eirseid resources lie here: ${lots.map(l=>`${l.name} x${l.room}`).join('; ')}. These are currently in the room, NOT in any backpack. The crew may collect them explicitly; do not award them automatically.`
+      : 'The previously located Eirseid resources have already been removed; do not respawn them.';
   }
   if (node.result === "Hazard Manifestation" && hazard) {
     const trap=node.eoeMechanicalTrap;
@@ -4561,8 +4941,8 @@ const eoeDebugTrapCommand = (operation,actionId) => {
 // ============================================================================
 // HP-01C7 — LOCATION-SCOPED PROCEDURAL DEBUG CREATURE
 // Reuse the canonical creature generator and health registry. Debug creatures
-// receive randomized, difficulty-weighted Wound capacity once, while natural
-// Site creatures remain unrated pending a later Mode-2 production bridge.
+// receive randomized, difficulty-weighted Wound capacity once. NCI-01
+// applies the same rating to first-introduced natural Site specimens.
 // No permanent Story Card: only current-location context contains this fixture,
 // preventing old test creatures from consuming context after CLEAR.
 // ============================================================================
@@ -4580,7 +4960,8 @@ const EOE_CREATURE_WOUNDS_BY_DIFFICULTY = Object.freeze({
 });
 const eoeRateDebugCreature = entry => {
   if (!entry || typeof entry.healthId!=="string" ||
-      !/^creature:debug:[0-9]+$/.test(entry.healthId)) return null;
+      !(/^creature:debug:[0-9]+$/.test(entry.healthId) ||
+       (entry.source==='natural' && /^creature:site_[0-9]+:[1-9][0-9]*$/.test(entry.healthId)))) return null;
   const h=eoeHealthRecord(entry.healthId);
   if (!h || h.kind!=="CREATURE" || h.schemaVersion!==1 ||
       !Array.isArray(h.injuries) || !Array.isArray(h.conditions) ||
@@ -4597,9 +4978,139 @@ const eoeRateDebugCreature = entry => {
   const roll=1+Math.floor(Math.random()*6);
   const max=row[roll-1];
   h.maxWounds=max;h.woundsRemaining=max;
-  h.creatureRating={schemaVersion:1,source:"CBT-01D2",difficulty:level,roll};
+  h.creatureRating={schemaVersion:1,source:entry.source==='natural'?'NCI-01':'CBT-01D2',difficulty:level,roll};
   log(`CREATURE TOUGHNESS | id=${entry.healthId} difficulty=${level} d6=${roll} wounds=${max}/${max}`);
   return h;
+};
+// NCI-01: Production combat identity for one already-introduced Site specimen.
+// Scope is strictly the CURRENT, visited, triggered Site room. Health remains
+// in eoeHealth under the original stable per-Site/per-area ID; there is no
+// second health ledger, no hidden-room promotion, and no respawn on revisit.
+const eoeActivateNaturalCreature = (site,node) => {
+  if (!site || !/^site_[0-9]+$/.test(String(site.siteId||'')) ||
+      !node || !Number.isSafeInteger(node.areaId) || node.areaId<1 ||
+      node.result!=='Encounter' || !node.visited || !node.encounterTriggered ||
+      !node.encounterCreature || node.eoeCombat!==undefined) return false;
+  const healthId=`creature:${site.siteId}:${node.areaId}`;
+  const health=eoeHealthRecord(healthId) ||
+    eoeHealthRegister(healthId,'CREATURE',node.encounterCreature.creatureName,null);
+  if (!health || health.kind!=='CREATURE') return false;
+  const entry={schemaVersion:1,source:'natural',healthId,status:'present',
+    engagement:'AT_RANGE',creature:node.encounterCreature};
+  const rated=eoeRateDebugCreature(entry);
+  if(!rated) return false;
+  node.eoeCombat=entry;
+  log(`NCI CREATURE ACTIVE | site=${site.siteId} area=${node.areaId} id=${healthId} `+
+    `species=${node.encounterCreature.creatureName} hp=${rated.woundsRemaining}/${rated.maxWounds} range=AT_RANGE`);
+  return true;
+};
+const eoeSiteCreatureOccupant = (site, node) => {
+  const home = node?.eoeCreatureOrigin == null ? node : getSiteNode(site, node.eoeCreatureOrigin);
+  const entry = home?.eoeCombat;
+  if (!entry || (entry.areaId ?? home.areaId) !== node.areaId ||
+      entry.healthId !== `creature:${site.siteId}:${home.areaId}`) return null;
+  return {home, entry};
+};
+const eoeCreatureExplorationBeat = (site, actionId) => {
+  if (!site || site.siteId !== state.currentSiteId || site.mode !== "EXPLORING_ACTIVE" ||
+      !Number.isSafeInteger(actionId) || actionId <= (site.eoeRoamingAction ?? -1)) return null;
+  site.eoeRoamingAction = actionId;
+  const room = getSiteNode(site, site.currentAreaId);
+  if (!room) return null;
+  const open = (from, exit) => {
+    const passage = site.passages?.[exit.passageId];
+    const to = getSiteNode(site, exit.to);
+    return passage && !passage.blocked && !passage.locked && to?.visited && to.areaId > 0 &&
+      to.exits.some(reverse => reverse.to === from.areaId && reverse.passageId === exit.passageId) ? to : null;
+  };
+  const adjacent = room.exits.map(exit => open(room, exit)).filter(Boolean);
+  const local = eoeSiteCreatureOccupant(site, room);
+  const eligible = node => node.result !== "Encounter" && !eoeSiteCreatureOccupant(site, node);
+  const move = (from, to, occupant, kind) => {
+    const {home,entry} = occupant;
+    delete from.eoeCreatureOrigin;
+    if (to !== home) to.eoeCreatureOrigin = home.areaId;
+    entry.areaId = to.areaId;
+    entry.engagement = "AT_RANGE";
+    if (entry.eoeEvasion) entry.eoeEvasion.phase = "EXPOSED";
+    const event = {actionId, kind, from:from.areaId, to:to.areaId, name:entry.creature.creatureName};
+    site.eoeRoamingEvent = event;
+    log(`SITE CREATURE | ${kind} ${event.name} ${event.from}->${event.to} action=${actionId}`);
+    return event;
+  };
+  if (local?.entry.status === "present") {
+    const hp = eoeHealthRecord(local.entry.healthId);
+    const retreat = adjacent.find(eligible);
+    if (retreat && hp && hp.status !== "dead" && hp?.woundsRemaining <= Math.floor(hp.maxWounds/2) &&
+        !/^DESTRUCTION/i.test(local.entry.creature.creatureDrive) && Math.random() < .25)
+      return move(room, retreat, local, "RETREAT");
+  }
+  if (!eligible(room)) return null;
+  for (const source of adjacent) {
+    const candidate = eoeSiteCreatureOccupant(site, source);
+    if (candidate?.entry.status !== "present" || candidate.entry.eoeEvasion?.phase === "ESCAPED" || eoeHealthRecord(candidate.entry.healthId)?.status === "dead") continue;
+    const drive = String(candidate.entry.creature.creatureDrive || "");
+    if (/^TERRITORY CONTROL/i.test(drive)) continue;
+    const pursues = /^(?:PREDATION|DESTRUCTION|PARASITIZATION)/i.test(drive) ||
+      candidate.entry.creature.creatureClass === "Lurker";
+    if (pursues && Math.random() < .30) return move(source, room, candidate, "PURSUIT");
+    if (Math.random() >= .15) continue;
+    const patrol = source.exits.map(exit => open(source, exit))
+      .find(node => node && node !== room && (node === candidate.home || eligible(node)));
+    if (patrol) return move(source, patrol, candidate, "PATROL");
+  }
+  return null;
+};
+const eoeNaturalCreatureAtLocation = () => {
+  const site=state.currentSiteId && state.sites && state.sites[state.currentSiteId];
+  if(!site || site.mode!=='EXPLORING_ACTIVE' ||
+     site.siteId!==state.currentSiteId ||
+     !/^site_[0-9]+$/.test(String(site.siteId||''))) return null;
+  const node=site.nodes && site.nodes[String(site.currentAreaId)];
+  if(!node || node.areaId!==site.currentAreaId || !node.visited) return null;
+  const occupant=eoeSiteCreatureOccupant(site,node);
+  if(!occupant) return null;
+  const {home,entry}=occupant, creature=home.encounterCreature;
+  if(home.result!=='Encounter' || !home.encounterTriggered || !creature ||
+     entry.schemaVersion!==1 || entry.source!=='natural' ||
+     (!entry.creature || entry.creature.creatureName!==creature.creatureName ||
+      entry.creature.creatureClass!==creature.creatureClass) ||
+     !['present','defeated'].includes(entry.status) ||
+     !EOE_ENGAGEMENTS.includes(eoeCreatureEngagement(entry)) ||
+     !creatureClasses.includes(creature.creatureClass)) return null;
+  const health=eoeHealthRecord(entry.healthId);
+  if(!eoeHealthValidWoundRecord(health) || health.kind!=='CREATURE' ||
+     (health.status==='dead')!==(entry.status==='defeated')) return null;
+  return {location:{key:`site:${site.siteId}:area:${node.areaId}`,siteId:site.siteId,
+      areaId:node.areaId,label:`Area ${node.areaId}`},
+    entry,creature,site,node,source:'natural'};
+};
+// The explicit debug fixture takes precedence at the same physical location;
+// production encounters are selected automatically otherwise.
+const eoeCombatCreatureAtLocation = () =>
+  eoeDebugCreatureAtLocation() || eoeNaturalCreatureAtLocation();
+const eoeNaturalCreatureStatus = () => {
+  const current=eoeNaturalCreatureAtLocation();
+  if(!current) return 'ENCOUNTER — No rated natural creature in this room. Previously visited legacy encounters retain their narrative history.';
+  const h=eoeHealthRecord(current.entry.healthId),c=current.creature;
+  return `ENCOUNTER — ${c.creatureName} (${c.creatureClass}), Area ${current.node.areaId}: `+
+    `${h.status.toUpperCase()}, ${h.woundsRemaining}/${h.maxWounds} Wounds. `+
+    `Engagement ${eoeCreatureEngagement(current.entry)}; evasion `+
+    `${current.entry.eoeEvasion?current.entry.eoeEvasion.phase:'EXPOSED'}. `+
+    'Physical attacks and evasion resolve from normal player language.';
+};
+// Re-entering a room is a NEW immediate encounter with the SAME individual.
+// A former escape never grants permanent immunity; existing Wounds and death
+// are never reset. No movement or pursuit occurs offscreen in NCI-01.
+const eoeNaturalCreatureReenter = (site,node) => {
+  const entry=site && node && eoeSiteCreatureOccupant(site,node)?.entry;
+  if(!entry ||
+     entry.source!=='natural' || entry.status!=='present' ||
+     !entry.healthId) return;
+  const h=eoeHealthRecord(entry.healthId);
+  if(!eoeHealthValidWoundRecord(h) || h.status==='dead')return;
+  entry.engagement='AT_RANGE';
+  if(entry.eoeEvasion) entry.eoeEvasion.phase='EXPOSED';
 };
 const eoeDebugCreatureLocation = eoeDebugTrapLocation;
 const eoeDebugCreatureStoreValid = store => !!store &&
@@ -4672,7 +5183,7 @@ const eoeDebugRangeCommand = (operation, actionId) => {
   const rifle=eoeEngagementAttackModifier("RIFLE",pos);
   return {ok:true,message:`DEBUG RANGE — ${creature.creatureName} at ${location.label}: ${pos}. `+
     `${enemyText}; hypothetical player rifle modifier ${rifle>=0?"+":""}${rifle} `+
-    "(rifle reference only; prototype pistol/knife player attacks can resolve against test creatures). " +
+    "(rifle, pistol and knife attacks can resolve against local creatures when owned). " +
     "Use #DEBUG RANGE AT_RANGE / ENGAGED to set test positioning; no roll, time, or damage."};
 };
 const eoeDebugCreatureCommand = (operation,actionId,requestedClass=null) => {
@@ -4860,10 +5371,27 @@ const eoeWeaponInventoryValid = x => !!x && x.schemaVersion===1 &&
     Number.isSafeInteger(x.items[k]) && x.items[k]>=0 && x.items[k]<=1000) &&
   (x.equipped===null || (typeof x.equipped==="string" &&
     !!EOE_WEAPONS[x.equipped] && x.items[x.equipped]>0));
+// SKL-START: One-time specialty equipment grant, including established
+// alpha.19 saves. Never re-grant a rifle after it is lost or discarded.
+// Ranged Combat qualifies in any of the three chosen specialty slots.
 const eoeWeaponInventory = () => {
-  if (state.eoeWeaponInventory===undefined)
+  const fresh=state.eoeWeaponInventory===undefined;
+  if (fresh)
     state.eoeWeaponInventory={schemaVersion:1,items:{ksa_pistol:1,combat_knife:1},equipped:"ksa_pistol"};
-  return eoeWeaponInventoryValid(state.eoeWeaponInventory)?state.eoeWeaponInventory:null;
+  const inv=eoeWeaponInventoryValid(state.eoeWeaponInventory)?state.eoeWeaponInventory:null;
+  if (!inv) return null; // damaged inventory fails closed, with no grant flag
+  const profile=state.eoePlayerProfile;
+  const ranged=profile && profile.kind==='PC' && Array.isArray(profile.specialties) &&
+    profile.specialties.includes('Ranged Combat');
+  if(ranged && !state.eoeStartingRifleGranted){
+    if(!(inv.items.rifle>0)) inv.items.rifle=1;
+    // Prefer the new rifle only for a newly initialized primary ranged build.
+    // Never alter an equipped weapon on an established adventure.
+    if(fresh && profile.specialties[0]==='Ranged Combat')inv.equipped='rifle';
+    state.eoeStartingRifleGranted=true;
+    log('SKL START GEAR | Ranged Combat rifle granted once');
+  }
+  return inv;
 };
 const eoeWeaponInventoryDisplay = () => {
   const inv=eoeWeaponInventory();
@@ -4872,7 +5400,7 @@ const eoeWeaponInventoryDisplay = () => {
     .map(k=>`${EOE_WEAPONS[k].name} x${inv.items[k]}`);
   return `GEAR — ${pieces.join('; ') || 'No tracked weapons'}. `+
     `Equipped: ${inv.equipped?EOE_WEAPONS[inv.equipped].name:'none'}. `+
-    "Starter weapons are provisioned once; ammunition and other equipment not yet tracked.";
+    "Starter weapons are provisioned once. See #INVENTORY for purchased gear; ammunition consumption is not yet modeled.";
 };
 const eoeWeaponFind = text => {
   const t=String(text||"").toLowerCase();
@@ -4930,7 +5458,7 @@ const eoeDetectCombatAttempt = raw => {
   // a creature elsewhere (e.g. shooting the wall while observing it) is not
   // permission to attack it. Warning shots are not creature attacks.
   const noun='(?:creature|beast|monster|thing|alien|enemy|brute|lurker|swarm|predator|it|them)';
-  const activeTarget=eoeDebugCreatureAtLocation();
+  const activeTarget=eoeCombatCreatureAtLocation();
   const targetName=activeTarget
     ? activeTarget.creature.creatureName.toLowerCase().trim() : "";
   const escapedName=targetName.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
@@ -4958,8 +5486,8 @@ const eoeResolveCombatAttempt = (detected,actionId) => {
   if (!Number.isSafeInteger(actionId) || actionId<0)
     return error('An action identity is required to roll safely.');
   if (!detected || !detected.ok) return error(detected && detected.error || 'Unrecognized attack.');
-  const target=eoeDebugCreatureAtLocation();
-  if(!target) return error('No supported test creature is present here. No attack rolled.');
+  const target=eoeCombatCreatureAtLocation();
+  if(!target) return error('No living, rated local creature is available for combat. No attack rolled.');
   if (target.entry.status==="defeated") return error('Creature is already dead; no attack rolled.');
   if(target.entry.eoeEvasion && target.entry.eoeEvasion.phase==='ESCAPED') return error('Encounter escaped; no target in immediate combat.');
   const health=eoeRateDebugCreature(target.entry);
@@ -5014,6 +5542,7 @@ const eoeResolveCombatAttempt = (detected,actionId) => {
   return {ok:true,actionId,weaponId:detected.weaponId,weaponName:EOE_WEAPONS[detected.weaponId].name,
     style:detected.style,skill:detected.skill,attempt:detected.attempt,thrown:detected.thrown,
     targetName:target.creature.creatureName,targetClass:target.creature.creatureClass,
+    targetSource:target.source||'debug',targetHealthId:target.entry.healthId,
     targetDrive:target.creature.creatureDrive,targetBehavior:target.creature.creatureClassBehavior,
     engagement,attackDie,defenseDie,score,penalty,situation,hiddenAtAttack,hiddenAttackBonus,attackTotal,defenseTotal,hit,
     creatureWoundApplied:wound ? wound.applied:0,
@@ -5046,7 +5575,54 @@ const eoeCombatAttemptContext = t =>
    : `The attempted combat action was not resolved: ${t && t.error||'unknown issue'}. `+
      `Do not narrate an attack, hit, injury, or creature death.`;
 
-// CBT-01D4 — natural-language nonlethal combat choices for local debug specimens.
+// Strip only line-leading narration that merges the named expedition ship
+// with an interior traversal or replays its flight. Keep other ships and dialogue.
+const eoeStripExpeditionShipScene = (prose, shipName) => {
+  if (!shipName) return prose;
+  const name = String(shipName).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = new RegExp(
+    `^[ \t]*(?:the +)?${name} +(?:hums?|vibrates?|thrums?)\\b[^.!?\\n]{0,90}\\b(?:as you (?:ascend|descend|cross|enter|step|walk)|as it (?:glides|flies|travels) through space)\\b[^.!?\\n]*[.!?]+[ \t]*`,
+    'gim'
+  );
+  return String(prose).replace(pattern, '');
+};
+
+
+// Drop only sentences that directly assert action by the named dead creature.
+const eoeRemoveDeadCreatureActions = (prose, name) => {
+  const escaped = String(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const action = new RegExp(`^\\s*(?:the\\s+)?(?:${escaped}|creature|beast|monster)\\s+(?:(?:still|again|suddenly)\\s+)?(?:attacks?|lunges?|charges?|pursues?|strikes?|stalks?|rises?|regains?|revives?|moves?|surges?)\\b`, 'i');
+  const sentences = String(prose).match(/[^.!?]+[.!?]*|[.!?]+/g) || [];
+  const kept = sentences.filter(sentence => !action.test(sentence));
+  return kept.length === sentences.length ? prose :
+    kept.join('').trim() || `${name} remains motionless.`;
+};
+
+// NCI-01: narrow safety net for a narrator that erroneously kills a living
+// natural Site creature. Never accept storyteller prose as a health mutation.
+// Leave ambiguous action descriptions untouched; substitute a short grounded
+// account only for explicit contradictory creature death claims.
+const eoeReconcileNaturalCombatProse = (prose,turn) => {
+  const s=String(prose||'').trim();
+  if(!s || !turn || !turn.ok || turn.targetSource!=='natural') return s;
+  const escaped=String(turn.targetName||'creature').replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  const subject=`(?:the\\s+)?(?:${escaped}|creature|beast|monster|alien)`;
+  // NCI-01 hardening: a mechanistically DEAD creature must not continue
+  // fighting because the narrator missed the final Wound. Keep prose intact
+  // unless it explicitly portrays the dead specimen moving or attacking.
+  if (turn.creatureDead) {
+    const acting=new RegExp(`\\b${subject}\\s+(?:still\\s+)?(?:surges?|lunges?|charges?|advances?|attacks?|strikes?|leaps?|runs?|stalks?|moves?|fights?)\\b`,'i');
+    const denial=new RegExp(`\\b${subject}\\s+.{0,45}?(?:still\\s+alive|not\\s+dead|hasn.t\\s+died|doesn.t\\s+die)\\b`,'i');
+    if(acting.test(s) || denial.test(s))return `Your ${turn.weaponName.toLowerCase()} strikes the ${String(turn.targetName).toLowerCase()}. The creature collapses and lies motionless. It is dead.`;
+    return s;
+  }
+  const death=new RegExp(`\\b${subject}\\s+(?:(?:collapses?|falls?|drops|lies|slumps?)\\s+(?:down\\s+)?(?:and\\s+)?|is\\s+)?(?:dead|lifeless|motionless|dies|died|expires|expired|killed|slain)\\b`,'i');
+  if(!death.test(s)) return s;
+  return turn.hit ? `Your ${turn.weaponName.toLowerCase()} strikes the ${String(turn.targetName).toLowerCase()}. It is wounded but still alive.`:
+    `Your ${turn.weaponName.toLowerCase()} attack misses the ${String(turn.targetName).toLowerCase()}. It remains alive.`;
+};
+
+// CBT-01D4/NCI-01 — natural-language evasion for any rated local creature.
 // Scope: the current creature ONLY. The room graph still owns physical room movement.
 // A successful escape ends IMMEDIATE encounter pressure, not expedition navigation.
 const eoeDetectEvasionIntent = raw => {
@@ -5077,8 +5653,8 @@ const eoeEvasionLedger = () => {
 const eoeResolveEvasion = (intent,actionId) => {
   const fail=error=>({ok:false,error,actionId,kind:intent&&intent.kind});
   if(!Number.isSafeInteger(actionId)||actionId<0) return fail('Stable action identity required.');
-  const active=eoeDebugCreatureAtLocation();
-  if(!active || active.entry.status!=='present') return fail('No living local test creature to evade.');
+  const active=eoeCombatCreatureAtLocation();
+  if(!active || active.entry.status!=='present') return fail('No living local creature to evade.');
   const h=eoeRateDebugCreature(active.entry),p=eoeHealthCanAct('pc');
   if(!h || h.status==='dead' || !p || !p.canAct) return fail('Combat participants cannot act.');
   const d=eoeCreatureDirectorState(active.entry);
@@ -5161,7 +5737,8 @@ const eoeReconcileEvasionProse = (prose,evasion,director) => {
   return scene;
 };
 
-// CBT-01D4 — opt-in narrative Creature Director pilot for local debug fixtures.
+// CBT-01D4/NCI-01 — narrative Creature Director for test creatures and
+// retaliatory local actions of newly introduced natural Site specimens.
 // Uses the GENERATED ATDW class/drive as the personality profile, but real
 // attacks, Wounds and engagement changes are exclusively resolved by JS.
 // Default OFF for old saves and new debug spawns: never silently introduce
@@ -5246,14 +5823,23 @@ const eoeCreatureDirectorStrike = (active,actionId) => {
     playerMaximum:player.maxWounds,playerDead:player.status==='dead'};
 };
 // At most one decision per *actual* player action. No decisions on #commands,
-// travel, navigation or setup. On repeated Input for same action, return the
+// travel, navigation or setup. Natural Site specimens stay passive mechanically
+// until attacked; after provocation this pilot can react locally, not roam. On repeated Input for same action, return the
 // stored event without rerolling or mutating either character.
 const eoeCreatureDirectorTick = (actionId,cause) => {
   if (!Number.isSafeInteger(actionId) || actionId<0) return null;
-  const active=eoeDebugCreatureAtLocation();
+  // Debug fixtures retain their original opt-in behavior. Normal Site
+  // specimens never attack an unprovoking player in NCI-01; after a real
+  // player attack they may react using the proven LOCAL director. This does
+  // not enable roaming, time advancement or unsolicited exploration attacks.
+  const active=eoeDebugCreatureAtLocation() || eoeNaturalCreatureAtLocation();
   if (!active || active.entry.status!=="present") return null;
   const d=eoeCreatureDirectorState(active.entry);
-  if (!d || !d.enabled) return null;
+  if(!d)return null;
+  if(active.source==='natural' && cause==='PLAYER_ATTACK'){
+    d.enabled=true;d.provoked=true;
+  }
+  if(!d.enabled) return null;
   if (d.lastActionId===actionId) return d.lastEvent;
   // Old-action retries may not advance the current position or re-run attacks.
   if (d.lastActionId!==null && actionId<d.lastActionId) return null;
@@ -5528,6 +6114,13 @@ const commitGraphMovement = (site, exitNumber, source) => {
     site.showExits = false;
     state.currentAreaId = 0;
     state.siteExplorationActive = false;
+    site.lastMove.actionCount = typeof info !== "undefined" ? info.actionCount : null;
+    site.lastMove.crewStored = eoeCrewStowSalvage();
+    if (state.eoeCrewSalvageEnabled !== false) {
+      site.lastMove.crewUnstored = eoeEconomyLots()
+        .filter(lot => eoeRoutineSalvage(lot) && lot.carried > 0)
+        .map(lot => `${lot.name} x${lot.carried}`);
+    }
     log(`SHIP BOARD | from=${from.areaId} via=${source} node=0`);
     return true;
   }
@@ -5539,12 +6132,14 @@ const commitGraphMovement = (site, exitNumber, source) => {
   if (firstVisit && !dest.discoveryScene) dest.discoveryScene = rollRoomDiscoveryNarrative(dest.result);
   dest.visited = true;
   dest.visitCount++;
+  if (firstVisit) eoeEconomyReveal(site,dest);
   if (firstVisit) {
     eoeArmSiteMechanicalTrap(site,dest,true);
     logGraphAreaReveal(dest);
     activateGraphCreature(dest);
     triggerGraphEncounter(dest, source);
-  }
+    eoeActivateNaturalCreature(site,dest);
+  } else eoeNaturalCreatureReenter(site,dest);
   const ambushNow = !!exit.status.ambush && !exit.status.ambushTriggered;
   if (ambushNow) exit.status.ambushTriggered = true;
   site.currentAreaId = dest.areaId;
@@ -5559,6 +6154,8 @@ const commitGraphMovement = (site, exitNumber, source) => {
       ? info.actionCount : null };
   site.navigationPending = null;
   site.showExits = true;
+  eoeCreatureExplorationBeat(site, site.lastMove.actionCount);
+  if (firstVisit && !site.lastMove.ambushNow) site.lastMove.crewRecovered = eoeCrewRecoverSalvage(site, dest);
   log(`NAV COMMIT | via=${source} ${from.areaId}->${dest.areaId} exit=${exit.number} ` +
       `new=${firstVisit} ambush=${ambushNow} visited=${state.siteExplorationCount}/${site.totalAreas}`);
   return true;
@@ -5579,12 +6176,14 @@ const enterGraphSite = (site, source) => {
   if (firstVisit && !node.discoveryScene) node.discoveryScene = rollRoomDiscoveryNarrative(node.result);
   node.visited = true;
   node.visitCount++;
+  if (firstVisit) eoeEconomyReveal(site,node);
   if (firstVisit) {
     eoeArmSiteMechanicalTrap(site,node,true);
     logGraphAreaReveal(node);
     activateGraphCreature(node);
     triggerGraphEncounter(node, source);
-  }
+    eoeActivateNaturalCreature(site,node);
+  } else eoeNaturalCreatureReenter(site,node);
   site.mode = "EXPLORING_ACTIVE";
   site.currentAreaId = node.areaId;
   site.entryPending = false;
@@ -5599,6 +6198,7 @@ const enterGraphSite = (site, source) => {
     source, needsNarration: source !== "AI",
     actionCount: typeof info !== "undefined" && Number.isFinite(info.actionCount)
       ? info.actionCount : null };
+  if (firstVisit && !site.lastMove.ambushNow) site.lastMove.crewRecovered = eoeCrewRecoverSalvage(site, node);
   log(`SITE ENTER | via=${source} node=${node.areaId} visited=${state.siteExplorationCount}/${site.totalAreas}`);
   return true;
 };
